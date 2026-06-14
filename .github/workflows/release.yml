@@ -1,0 +1,58 @@
+name: Build release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  # Create the release once, up front, so the matrix build jobs below never
+  # race each other to create it (which fails with "tag_name already_exists").
+  create-release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: softprops/action-gh-release@v2
+
+  build:
+    needs: create-release
+    strategy:
+      matrix:
+        include:
+          - os: windows-latest
+            artifact: siminput-updater.exe
+            suffix: -windows.exe
+          - os: ubuntu-22.04
+            artifact: siminput-updater
+            suffix: -linux
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install system dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y python3-tk
+
+      - name: Install Python dependencies
+        run: |
+          pip install --upgrade pip
+          pip install .[dev]
+
+      - name: Build executable
+        run: pyinstaller siminput-updater.spec
+
+      - name: Rename artifact
+        shell: bash
+        run: mv dist/${{ matrix.artifact }} dist/siminput-updater${{ matrix.suffix }}
+
+      - name: Upload to release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/siminput-updater${{ matrix.suffix }}
