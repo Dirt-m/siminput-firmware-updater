@@ -190,7 +190,7 @@ wheels = [
 
 [[package]]
 name = "siminput-updater"
-version = "1.0.0"
+version = "1.0.1"
 source = { editable = "." }
 dependencies = [
     { name = "customtkinter" },
