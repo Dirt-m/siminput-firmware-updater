@@ -394,7 +394,10 @@ class Device:
         if self._evdev:
             caps = self._evdev.capabilities()
             btn_codes = sorted(caps.get(ec.EV_KEY, []))
-            self._btn_map = {code: i + 1 for i, code in enumerate(btn_codes)}
+            # Bit i of the HID report is B<i>; the first usage (index 0) is B0,
+            # which the firmware never drives. Numbering codes by index keeps
+            # the monitor consistent with config B-names and the serial stream.
+            self._btn_map = {code: i for i, code in enumerate(btn_codes)}
             self._stream_thread = threading.Thread(target=self._evdev_reader, daemon=True)
         else:
             if self._port:
@@ -432,7 +435,7 @@ class Device:
                     axes[code] = absinfo.value
             for code in dev.active_keys():
                 btn_num = self._btn_map.get(code)
-                if btn_num is not None:
+                if btn_num:  # 0 is B0 — unused by the firmware
                     buttons.add(btn_num)
         except (OSError, IOError, SystemError):
             pass
@@ -450,7 +453,7 @@ class Device:
                         axes[event.code] = event.value
                     elif event.type == ec.EV_KEY:
                         btn_num = self._btn_map.get(event.code)
-                        if btn_num is not None:
+                        if btn_num:
                             if event.value:
                                 buttons.add(btn_num)
                             else:
