@@ -11,6 +11,8 @@ Plain-tk widgets (Canvas) can't take tuples — pass colours through resolve().
 
 from __future__ import annotations
 
+import sys
+
 import customtkinter as ctk
 
 # -- Surfaces (layered: cool near-white / warm-neutral near-black) --
@@ -70,8 +72,13 @@ def font(size: int = 13, weight: str = "normal") -> ctk.CTkFont:
     return ctk.CTkFont(size=size, weight=weight)
 
 
+# "monospace" is an alias only fontconfig (Linux) understands; Windows and
+# macOS substitute a proportional font for unknown families.
+MONO_FAMILY = {"win32": "Consolas", "darwin": "Menlo"}.get(sys.platform, "monospace")
+
+
 def mono(size: int = 12, weight: str = "normal") -> ctk.CTkFont:
-    return ctk.CTkFont(family="monospace", size=size, weight=weight)
+    return ctk.CTkFont(family=MONO_FAMILY, size=size, weight=weight)
 
 
 def primary_button(master, text: str, command=None, **kw) -> ctk.CTkButton:

@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+import time
 import zipfile
 from dataclasses import dataclass
-from pathlib import PurePosixPath
+from pathlib import Path, PurePosixPath
 from typing import Callable
 
 ALLOWED_PATHS = {"config.json", "code.py", "boot.py"}
@@ -102,11 +103,23 @@ def load_firmware_zip(zip_path: str) -> FirmwarePackage:
 
 
 def upload_order(files: list[FirmwareFile]) -> list[FirmwareFile]:
-    libs = [f for f in files if f.path.startswith("lib/")]
-    boot = [f for f in files if f.path == "boot.py"]
-    code = [f for f in files if f.path == "code.py"]
-    other = [f for f in files if f not in libs and f not in boot and f not in code]
-    return libs + other + boot + code
+    def rank(f: FirmwareFile) -> int:
+        if f.path.startswith("lib/"):
+            return 0
+        if f.path == "boot.py":
+            return 2
+        if f.path == "code.py":
+            return 3
+        return 1
+    return sorted(files, key=rank)
+
+
+def _write_backup(config: dict) -> Path:
+    backup_dir = Path.home() / "SIMINPUT Backups"
+    backup_dir.mkdir(parents=True, exist_ok=True)
+    path = backup_dir / f"config-backup-{time.strftime('%Y%m%d-%H%M%S')}.json"
+    path.write_text(json.dumps(config, indent=2), encoding="utf-8")
+    return path
 
 
 def perform_update(
@@ -130,13 +143,14 @@ def perform_update(
 
     check_cancel()
 
-    config_backup = None
+    backup_path = None
     if backup_config:
         status("Backing up current configuration...")
         try:
-            config_backup = device.get_config()
-        except Exception:
-            status("Warning: could not back up config")
+            backup_path = _write_backup(device.get_config())
+            status(f"  Config backed up to {backup_path}")
+        except Exception as e:
+            status(f"Warning: could not back up config ({e})")
 
     ordered = upload_order(package.files)
     total_bytes = sum(f.size for f in ordered)
@@ -191,6 +205,6 @@ def perform_update(
         return info.version
     except Exception as e:
         status(f"Could not reconnect: {e}")
-        if config_backup:
-            status("Config backup was saved before update")
+        if backup_path:
+            status(f"Your config backup is at {backup_path}")
         raise

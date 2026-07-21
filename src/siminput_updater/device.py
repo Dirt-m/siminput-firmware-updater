@@ -5,6 +5,7 @@ import getpass
 import hashlib
 import json
 import select
+import sys
 import threading
 import time
 from dataclasses import dataclass
@@ -71,6 +72,7 @@ class Device:
         self._keepalive: Any | None = None
         self._evdev: Any | None = None
         self._btn_map: dict[int, int] = {}
+        self._serial_number: str | None = None
 
     @property
     def connected(self) -> bool:
@@ -113,18 +115,36 @@ class Device:
         if self._keepalive is not None:
             try:
                 self._keepalive.fd
-                return
+                # Keep it unless it demonstrably belongs to a different box
+                # than the live connection (uniq is often empty — then keep).
+                held = self._keepalive.uniq or ""
+                if not self._serial_number or held in ("", self._serial_number):
+                    return
+                self._keepalive.close()
             except OSError:
-                self._keepalive = None
+                pass
+            self._keepalive = None
+        # Prefer the evdev node whose USB serial matches the connected box, so
+        # the live monitor never streams a different box's inputs.
+        fallback = None
         for path in evdev.list_devices():
             try:
                 dev = evdev.InputDevice(path)
-                if dev.info.vendor == ADAFRUIT_VID:
-                    self._keepalive = dev
-                    return
-                dev.close()
             except (PermissionError, OSError):
                 continue
+            if dev.info.vendor != ADAFRUIT_VID:
+                dev.close()
+                continue
+            if self._serial_number and dev.uniq == self._serial_number:
+                if fallback is not None:
+                    fallback.close()
+                self._keepalive = dev
+                return
+            if fallback is None:
+                fallback = dev
+            else:
+                dev.close()
+        self._keepalive = fallback
 
     @staticmethod
     def list_ports() -> set[str]:
@@ -153,12 +173,23 @@ class Device:
         try:
             port = serial.Serial(port_info.device, timeout=0.5)
         except (PermissionError, serial.SerialException, OSError) as e:
-            if "Permission denied" in str(e) or "Errno 13" in str(e):
-                return DeviceInfo(
-                    **fallback, status="no_permission",
-                    status_detail=f"Permission denied — run: sudo usermod -aG dialout {getpass.getuser()} (then log out and back in)",
-                )
-            return DeviceInfo(**fallback, status="open_failed", status_detail=str(e))
+            err = str(e)
+            denied = (
+                isinstance(e, PermissionError)
+                or "Permission denied" in err or "Errno 13" in err
+                or "PermissionError" in err or "Access is denied" in err
+            )
+            if denied:
+                if sys.platform == "linux":
+                    try:
+                        user = getpass.getuser()
+                    except Exception:
+                        user = "$USER"
+                    detail = f"Permission denied — run: sudo usermod -aG dialout {user} (then log out and back in)"
+                else:
+                    detail = "Access denied — the port may be in use by another program"
+                return DeviceInfo(**fallback, status="no_permission", status_detail=detail)
+            return DeviceInfo(**fallback, status="open_failed", status_detail=err)
 
         try:
             resp = Device._ping_port(port, timeout=1.2)
@@ -236,9 +267,14 @@ class Device:
 
     def connect(self, port_name: str) -> DeviceInfo:
         self.disconnect()
+        self._serial_number = next(
+            (p.serial_number for p in serial.tools.list_ports.comports()
+             if p.device == port_name),
+            None,
+        )
         try:
             self._port = serial.Serial(port_name, timeout=0.5)
-        except serial.SerialException as e:
+        except (serial.SerialException, OSError) as e:
             raise DeviceError(f"Failed to open {port_name}: {e}")
         # Two attempts: the first ping after enumeration can get lost while
         # CircuitPython is still bringing up the CDC data endpoint.
@@ -271,6 +307,7 @@ class Device:
                 pass
         self._port = None
         self._info = None
+        self._serial_number = None
 
     def _drain_acks(self):
         """Read and discard complete lines pending from the device (e.g. per-chunk acks)."""
@@ -367,18 +404,21 @@ class Device:
         self._stream_thread.start()
 
     def stop_stream(self):
-        if self._streaming:
-            self._streaming = False
-            if not self._evdev:
-                try:
-                    self._send({"cmd": "stream_stop"})
-                except (DeviceError, serial.SerialException, OSError, json.JSONDecodeError):
-                    pass  # port may already be gone (unplugged mid-stream)
-            if self._stream_thread:
-                self._stream_thread.join(timeout=2.0)
-                self._stream_thread = None
-            self._evdev = None
-            self._stream_callback = None
+        if not self._streaming:
+            return
+        self._streaming = False
+        # Join the reader first so it can't race _send for the port.
+        if self._stream_thread:
+            self._stream_thread.join(timeout=2.0)
+            self._stream_thread = None
+        if not self._evdev:
+            try:
+                self._send({"cmd": "stream_stop"})
+                self._drain_acks()  # discard frames queued before the stop took effect
+            except (DeviceError, serial.SerialException, OSError, json.JSONDecodeError):
+                pass  # port may already be gone (unplugged mid-stream)
+        self._evdev = None
+        self._stream_callback = None
 
     def _evdev_reader(self):
         axes = [32767] * 8
@@ -429,13 +469,17 @@ class Device:
                     buf += self._port.read(n)
                     while b"\n" in buf:
                         line, buf = buf.split(b"\n", 1)
-                        if line:
+                        if not line:
+                            continue
+                        try:
                             msg = json.loads(line.decode("utf-8", errors="replace"))
-                            if "s" in msg and self._stream_callback:
-                                self._stream_callback(msg["s"])
+                        except json.JSONDecodeError:
+                            continue  # partial or non-JSON line — skip, keep streaming
+                        if "s" in msg and self._stream_callback:
+                            self._stream_callback(msg["s"])
                 else:
                     time.sleep(0.005)
-            except (serial.SerialException, json.JSONDecodeError, OSError):
+            except (serial.SerialException, OSError):
                 break
 
     def update_begin(self) -> None:
