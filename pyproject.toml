@@ -1,6 +1,6 @@
 [project]
 name = "siminput-updater"
-version = "1.0.0"
+version = "1.0.1"
 description = "Desktop configurator and firmware updater for SIMINPUT modular button boxes"
 readme = "README.md"
 requires-python = ">=3.12"
