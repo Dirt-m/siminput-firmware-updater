@@ -85,7 +85,7 @@ class BoolVar:
 
     @classmethod
     def from_dict(cls, d: dict) -> BoolVar:
-        return cls(id=d["id"], default=d.get("default", False), store=d.get("store", False))
+        return cls(id=d.get("id", ""), default=d.get("default", False), store=d.get("store", False))
 
 
 @dataclass
@@ -107,7 +107,7 @@ class Axis:
     @classmethod
     def from_dict(cls, d: dict) -> Axis:
         return cls(
-            id=d["id"],
+            id=d.get("id", ""),
             output=d.get("output", 1),
             default=d.get("default", 32767),
             store=d.get("store", False),
@@ -176,8 +176,11 @@ class Rule:
 
     @classmethod
     def from_dict(cls, d: dict) -> Rule:
+        # Tolerate missing keys — validate() reports the problems with paths,
+        # which beats a bare KeyError surfacing in the UI.
+        tp = d.get("type", "")
         return cls(
-            type=d["type"],
+            type=tp,
             input=d.get("input", ""),
             inputs=d.get("inputs", []),
             output=d.get("output", ""),
@@ -185,7 +188,7 @@ class Rule:
             ccw=d.get("ccw", ""),
             axis=d.get("axis", ""),
             invert=d.get("invert", False),
-            pulse_ms=d.get("pulse_ms", 100 if d["type"] == "PULSE" else 0),
+            pulse_ms=d.get("pulse_ms", 100 if tp == "PULSE" else 0),
             delay_ms=d.get("delay_ms", 0),
             step=d.get("step", 1),
             divisor=d.get("divisor", 2),

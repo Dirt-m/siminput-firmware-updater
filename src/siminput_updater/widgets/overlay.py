@@ -76,7 +76,8 @@ class BusyOverlay(ctk.CTkFrame):
         self.action_btn.configure(
             text="Abort", state="normal",
             fg_color="transparent", hover_color=t.ERROR_SOFT,
-            text_color=t.ERROR, border_color=t.ERROR, command=self._cancel_clicked,
+            text_color=t.ERROR, border_width=1, border_color=t.ERROR,
+            command=self._cancel_clicked,
         )
         self.progress.configure(progress_color=t.ACCENT)
         if indeterminate:

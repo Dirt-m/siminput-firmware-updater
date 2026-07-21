@@ -24,7 +24,7 @@ RESCAN_TICKS = 3               # full re-probe cadence while unconnected, in tic
 CONNECT_COOLDOWN_TICKS = 3     # ticks a port sits out of auto-connect after failing
 LABEL_SEARCHING = "Searching for devices…"
 FIRMWARE_RELEASES_URL = "https://github.com/Dirt-m/siminput-firmware-v2/releases"
-CONNECTABLE = ("ok", "no_protocol", "no_response")
+CONNECTABLE = ("ok", "no_response")
 
 
 class App(ctk.CTk):
