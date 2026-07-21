@@ -156,11 +156,16 @@ def perform_update(
     total_bytes = sum(f.size for f in ordered)
     uploaded_bytes = 0
 
-    transactional = hasattr(device, "update_begin")
-
-    if transactional:
-        status("Starting transactional update (staged writes)...")
-        device.update_begin()
+    # Older firmware has no update_begin — probing is the only reliable check,
+    # since the client class always has the method.
+    transactional = False
+    if hasattr(device, "update_begin"):
+        try:
+            device.update_begin()
+            transactional = True
+            status("Starting transactional update (staged writes)...")
+        except Exception as e:
+            status(f"Staged update unavailable ({e}) — writing files directly")
 
     try:
         for f in ordered:

@@ -365,6 +365,11 @@ def validate(config: Config, board_map: str = "") -> list[ValidationError]:
                 errors.append(ValidationError(f"{path}.input", f"Unknown input '{r.input}'"))
             if r.output and r.output not in valid_outputs:
                 errors.append(ValidationError(f"{path}.output", f"Unknown output '{r.output}'"))
+            if r.type == "PULSE":
+                if not isinstance(r.pulse_ms, int) or r.pulse_ms < 0:
+                    errors.append(ValidationError(f"{path}.pulse_ms", "Pulse must be 0 ms or more"))
+                if not isinstance(r.delay_ms, int) or r.delay_ms < 0:
+                    errors.append(ValidationError(f"{path}.delay_ms", "Delay must be 0 ms or more"))
 
         elif r.type == "NOR":
             for j, inp in enumerate(r.inputs):
@@ -379,6 +384,10 @@ def validate(config: Config, board_map: str = "") -> list[ValidationError]:
             for j, inp in enumerate(r.inputs):
                 if inp not in reserved:
                     errors.append(ValidationError(f"{path}.inputs[{j}]", f"Encoder pin must be a physical pin, not '{inp}'"))
+            if r.divisor not in (1, 2, 4):
+                errors.append(ValidationError(f"{path}.divisor", "Steps/detent must be 1, 2, or 4"))
+            if not isinstance(r.pulse_ms, int) or r.pulse_ms < 0:
+                errors.append(ValidationError(f"{path}.pulse_ms", "Pulse must be 0 ms or more"))
 
         elif r.type in ("AXIS_INC", "AXIS_DEC"):
             if r.input and r.input not in valid_inputs:
