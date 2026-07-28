@@ -126,15 +126,14 @@ class MockDevice:
             circuitpython="9.2.0",
             board="raspberry_pi_pico",
             nvm_size=4096,
-            pins={
-                "expander": [f"D{i}" for i in range(1, 15)],
-                "gpio": [f"D{i}" for i in range(15, 25)],
-                "adc": ["A6", "A7", "A8"],
-            },
+            pins=sorted(pins_for_board(MOCK_BOARD_MAP)),
             bools=[b["id"] for b in self._config.get("bools", [])],
             axes=[a["id"] for a in self._config.get("axes", [])],
             rules_count=len(self._config.get("rules", [])),
             hash_algo="sha256",
+            protocol=2,
+            caps=("staged_update", "hard_reboot", "stream", "chunked_config", "request_id"),
+            limits={"max_line": 4096, "chunk": 2048, "max_config": 32768},
         )
 
     def get_config(self) -> dict:

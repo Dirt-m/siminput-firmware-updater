@@ -7,6 +7,7 @@ from typing import Callable
 import customtkinter as ctk
 
 from . import ui_theme as t
+from .applog import log
 from .operations import OperationCancelled, OperationContext
 from .widgets.overlay import BusyOverlay
 from .pages.device_page import DevicePage
@@ -76,6 +77,15 @@ class App(ctk.CTk):
         self._show_page("device")
         self._refresh_connection_view()
         self._scan_tick()
+
+    def report_callback_exception(self, exc, val, tb):
+        """Tk routes exceptions raised inside event callbacks here. The
+        packaged build has no console, so without this hook they vanish."""
+        log.error("unhandled UI exception", exc_info=(exc, val, tb))
+        try:
+            self.show_status(f"Internal error: {val}", "error", 8000)
+        except Exception:
+            pass
 
     def _on_close(self):
         if self._operation_active:
@@ -297,6 +307,20 @@ class App(ctk.CTk):
     def board_map(self) -> str:
         info = self.device.info if self.device.connected else None
         return info.board_map if info else ""
+
+    @property
+    def device_pins(self) -> list[str] | None:
+        """The connected device's own pin list (protocol 2). Preferred over
+        the hardcoded per-revision table: a future board revision validates
+        correctly without a configurator release."""
+        full = self.full_info
+        pins = getattr(full, "pins", None) if full else None
+        if isinstance(pins, list) and pins:
+            return list(pins)
+        if isinstance(pins, dict):  # older shape: {category: [names]}
+            flat = [p for group in pins.values() for p in group]
+            return flat or None
+        return None
 
     # ------------------------------------------------------- background scan
 

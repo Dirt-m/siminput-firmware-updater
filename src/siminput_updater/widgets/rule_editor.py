@@ -54,9 +54,16 @@ class RuleCard(ctk.CTkFrame):
             font=t.mono(12, "bold"), text_color=t.TEXT_MUTED,
         ).grid(row=0, column=0, padx=(2, 8))
 
-        self.type_menu = _option(header, RULE_TYPE_DISPLAY, command=self._on_type_change, width=150)
-        self.type_menu.set(RULE_TYPE_LABELS.get(rule.type, RULE_TYPE_DISPLAY[0]))
-        self.type_menu.grid(row=0, column=1, padx=(0, 12))
+        if not rule.comment:
+            self.type_menu = _option(header, RULE_TYPE_DISPLAY, command=self._on_type_change, width=150)
+            self.type_menu.set(RULE_TYPE_LABELS.get(rule.type, RULE_TYPE_DISPLAY[0]))
+            self.type_menu.grid(row=0, column=1, padx=(0, 12))
+        else:
+            # A comment row from a hand-written config: shown, movable, and
+            # deletable, but not editable — it round-trips verbatim on save.
+            ctk.CTkLabel(header, text="Comment", width=150, anchor="w",
+                         font=t.font(12, "bold"), text_color=t.TEXT_MUTED).grid(
+                row=0, column=1, padx=(0, 12))
 
         self.summary_label = ctk.CTkLabel(
             header, text=rule.summary(), anchor="w", font=t.font(12), text_color=t.TEXT_MUTED)
@@ -81,7 +88,8 @@ class RuleCard(ctk.CTkFrame):
         self.fields.grid(row=1, column=0, sticky="ew", padx=(34, 14), pady=(4, 16))
         self.fields.grid_columnconfigure(0, weight=1)
         self._row_count = 0
-        self._build_fields()
+        if not rule.comment:
+            self._build_fields()
 
     # ------------------------------------------------------------- fields
 
@@ -180,6 +188,18 @@ class RuleCard(ctk.CTkFrame):
         self._widgets["axis"] = menu
         return menu
 
+    def refresh_axis_choices(self):
+        """Called when the Rules tab is shown, so axes added or renamed on the
+        Axes tab appear in the dropdown without requiring a rule edit."""
+        menu = self._widgets.get("axis")
+        if menu is None:
+            return
+        choices = self.editor.axis_choices() or [""]
+        current = menu.get()
+        if current and current not in choices:
+            choices = [current, *choices]
+        menu.configure(values=choices)
+
     def _invert(self, row):
         cb = ctk.CTkCheckBox(
             row, text="Invert", command=self._sync, font=t.font(12),
@@ -198,6 +218,9 @@ class RuleCard(ctk.CTkFrame):
             if label == display_name:
                 self.rule.type = key
                 break
+        # Per-type pulse default, matching the firmware: 100 ms for PULSE,
+        # single-cycle (0) for everything else including ENCODER.
+        self.rule.pulse_ms = 100 if self.rule.type == "PULSE" else 0
         self._build_fields()
         self._sync()
 
@@ -213,7 +236,12 @@ class RuleCard(ctk.CTkFrame):
         if "inputs" in w:
             self.rule.inputs = [s.strip() for s in w["inputs"].get().split(",") if s.strip()]
         if "pin_a" in w or "pin_b" in w:
-            self.rule.inputs = [w[k].get().strip() for k in ("pin_a", "pin_b") if k in w and w[k].get().strip()]
+            # Positional: clearing Pin A must not shift Pin B into its slot on
+            # the next rebuild. Empty slots are validation errors, not gaps.
+            self.rule.inputs = [
+                w["pin_a"].get().strip() if "pin_a" in w else "",
+                w["pin_b"].get().strip() if "pin_b" in w else "",
+            ]
         if "output" in w:
             self.rule.output = w["output"].get().strip()
         if "cw" in w:
@@ -262,13 +290,18 @@ class RuleEditor(ctk.CTkFrame):
             return []
 
     def load_rules(self, rules: list[Rule]):
-        self._rules = [Rule(**r.__dict__) for r in rules]
+        self._rules = [r.copy() for r in rules]
         self._rebuild()
 
     def collect_rules(self) -> list[Rule]:
         for card in self._cards:
-            card._apply_edits()
-        return [Rule(**r.__dict__) for r in self._rules]
+            if not card.rule.comment:
+                card._apply_edits()
+        return [r.copy() for r in self._rules]
+
+    def refresh_axis_menus(self):
+        for card in self._cards:
+            card.refresh_axis_choices()
 
     def _rebuild(self):
         for card in self._cards:

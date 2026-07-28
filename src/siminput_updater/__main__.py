@@ -92,6 +92,10 @@ def main():
             except ValueError:
                 pass
 
+    from .applog import log, setup_logging
+    setup_logging()
+    log.info("starting (mock=%s)", use_mock)
+
     _apply_scaling(scale_override)
     _fix_linux_scroll()
 
