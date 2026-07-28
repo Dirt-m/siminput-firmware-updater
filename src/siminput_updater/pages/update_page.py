@@ -92,6 +92,14 @@ class UpdatePage(ctk.CTkFrame):
         self._refresh_action()
 
     def _refresh_action(self):
+        # Keep the "on device" chip current: it used to be written only when a
+        # package was chosen, so it showed the pre-flash version after an
+        # update and the previous device's version after switching boxes.
+        if self.app.device.connected and self.app.device.info:
+            self._cur_ver.configure(text=f"v{self.app.device.info.version}")
+        else:
+            self._cur_ver.configure(text="—")
+
         if not self.package:
             self.upload_btn.configure(state="disabled", fg_color=t.SURFACE_3, text_color=t.TEXT_MUTED)
             self.hint.configure(text="Select a firmware package to begin.", text_color=t.TEXT_MUTED)
@@ -120,11 +128,7 @@ class UpdatePage(ctk.CTkFrame):
 
         self.file_label.configure(text=Path(path).name, text_color=t.TEXT)
 
-        current = "unknown"
-        if self.app.device.connected and self.app.device.info:
-            current = self.app.device.info.version
         self._pkg_ver.configure(text=f"v{self.package.firmware_version}")
-        self._cur_ver.configure(text=f"v{current}" if current != "unknown" else "—")
         self._file_count.configure(text=str(len(self.package.files)))
 
         self.files_box.configure(state="normal")
@@ -170,6 +174,7 @@ class UpdatePage(ctk.CTkFrame):
             version, full = result
             if self.app.device.connected and self.app.device.info:
                 self.app.notify_connected(self.app.device.info, full)
+            self._refresh_action()
             self.app.show_status(f"Firmware updated to v{version}", "success", 6000)
 
         self.app.run_operation(

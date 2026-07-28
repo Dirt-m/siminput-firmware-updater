@@ -29,11 +29,21 @@ class OperationContext:
         if self._cancel.is_set():
             raise OperationCancelled()
 
+    def _post(self, fn) -> None:
+        # The window can be destroyed while a worker is still running; posting
+        # to a dead Tk raises RuntimeError from the worker thread.
+        if getattr(self._app, "_closing", False):
+            return
+        try:
+            self._app.after(0, fn)
+        except RuntimeError:
+            pass
+
     def status(self, message: str) -> None:
-        self._app.after(0, lambda: self._app.overlay.set_status(message))
+        self._post(lambda: self._app.overlay.set_status(message))
 
     def log(self, message: str) -> None:
-        self._app.after(0, lambda: self._app.overlay.append_log(message))
+        self._post(lambda: self._app.overlay.append_log(message))
 
     def progress(self, fraction: float) -> None:
-        self._app.after(0, lambda: self._app.overlay.set_progress(fraction))
+        self._post(lambda: self._app.overlay.set_progress(fraction))
