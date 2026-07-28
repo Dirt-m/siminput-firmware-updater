@@ -38,6 +38,30 @@ class UpdateCancelled(FirmwareError):
     pass
 
 
+def _own_version() -> str:
+    try:
+        from importlib.metadata import version
+        return version("siminput-updater")
+    except Exception:
+        return "0"
+
+
+def _version_less(a: str, b: str) -> bool:
+    """True when version string a < b (dotted-integer comparison; unparsable
+    parts compare as 0, so malformed manifest values never block a load)."""
+    def parts(v: str) -> list[int]:
+        out = []
+        for piece in v.split("."):
+            digits = "".join(ch for ch in piece if ch.isdigit())
+            out.append(int(digits) if digits else 0)
+        return out
+    pa, pb = parts(a), parts(b)
+    length = max(len(pa), len(pb))
+    pa += [0] * (length - len(pa))
+    pb += [0] * (length - len(pb))
+    return pa < pb
+
+
 def _is_path_allowed(path: str) -> bool:
     normalized = PurePosixPath(path).as_posix()
     if ".." in normalized or normalized.startswith("/"):
@@ -58,6 +82,13 @@ def load_firmware_zip(zip_path: str) -> FirmwarePackage:
                 raise FirmwareError("manifest.json must contain a JSON object")
 
             fw_version = manifest.get("firmware_version", "unknown")
+
+            min_updater = manifest.get("min_updater_version")
+            if min_updater and _version_less(_own_version(), str(min_updater)):
+                raise FirmwareError(
+                    f"This package needs configurator v{min_updater} or newer "
+                    f"(you have v{_own_version()}). Update the app first."
+                )
 
             entries = manifest.get("files", [])
             if not isinstance(entries, list) or not entries:

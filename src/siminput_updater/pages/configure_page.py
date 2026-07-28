@@ -62,8 +62,14 @@ class ConfigurePage(ctk.CTkFrame):
     def __init__(self, parent, app: App):
         super().__init__(parent, fg_color="transparent")
         self.app = app
-        self.config = Config()
         self._dirty = False
+        # Comment entries (id-less bools/axes from hand-written configs) are
+        # not editable in the UI; they're held here and re-appended on save so
+        # a round trip never destroys them.
+        self._bool_comments: list[BoolVar] = []
+        self._axis_comments: list[Axis] = []
+        self._config_extra: dict = {}
+        self._device_extra: dict = {}
 
         self.grid_columnconfigure(0, weight=1)
         self.grid_rowconfigure(2, weight=1)
@@ -149,6 +155,10 @@ class ConfigurePage(ctk.CTkFrame):
             else:
                 frame.grid_remove()
         self._current_tab = name
+        if name == "Rules":
+            # Axes may have been added or renamed since the rule cards were
+            # built — refresh the AXIS_* dropdowns so they can be selected.
+            self.rule_editor.refresh_axis_menus()
 
     # -- Device tab --
 
@@ -248,7 +258,8 @@ class ConfigurePage(ctk.CTkFrame):
             command=lambda f=frame: self._remove_var(f))
         del_btn.grid(row=0, column=4, padx=(6, 12), pady=10)
 
-        self._var_widgets.append({"frame": frame, "name": name_entry, "default": default_switch, "store": store_cb})
+        self._var_widgets.append({"frame": frame, "name": name_entry, "default": default_switch,
+                                  "store": store_cb, "extra": dict(bv.extra)})
         self._mark_dirty()
 
     def _remove_var(self, frame):
@@ -302,12 +313,17 @@ class ConfigurePage(ctk.CTkFrame):
 
         ctk.CTkLabel(frame, text="Output", font=t.font(12), text_color=t.TEXT_DIM).grid(
             row=0, column=2, padx=(14, 6), pady=10)
-        slot_options = [f"{v} ({k})" if isinstance(k, int) else v for k, v in AXIS_SLOT_LABELS.items()]
-        if isinstance(ax.output, int):
-            current_slot = f"{AXIS_SLOT_LABELS.get(ax.output, 'X')} ({ax.output})"
-        else:
-            current_slot = AXIS_SLOT_LABELS.get(ax.output, "Backlight Only")
-        slot_menu = _option(frame, slot_options, command=lambda v: self._mark_dirty(), width=140)
+        # Explicit label→value map, so the slot survives any future label
+        # wording instead of being re-parsed out of the display string.
+        slot_map: dict[str, int | str] = {}
+        for k, v in AXIS_SLOT_LABELS.items():
+            label = f"{v} ({k})" if isinstance(k, int) else v
+            slot_map[label] = k
+        current_slot = next(
+            (label for label, val in slot_map.items() if val == ax.output),
+            f"{AXIS_SLOT_LABELS[1]} (1)",
+        )
+        slot_menu = _option(frame, list(slot_map), command=lambda v: self._mark_dirty(), width=140)
         slot_menu.set(current_slot)
         slot_menu.grid(row=0, column=3, padx=6, pady=10)
 
@@ -339,9 +355,10 @@ class ConfigurePage(ctk.CTkFrame):
             bl_cb.select()
 
         widgets = {
-            "frame": frame, "name": name_entry, "slot": slot_menu,
+            "frame": frame, "name": name_entry, "slot": slot_menu, "slot_map": slot_map,
             "default": default_slider, "default_val": int(ax.default),
             "default_lbl": default_lbl, "store": store_cb, "backlight": bl_cb,
+            "extra": dict(ax.extra),
         }
         default_slider.configure(command=lambda v, w=widgets: self._on_axis_default(v, w))
         self._axis_widgets.append(widgets)
@@ -379,13 +396,32 @@ class ConfigurePage(ctk.CTkFrame):
 
     # ----------------------------------------------------- config sync
 
+    def _input_errors(self) -> list[str]:
+        """Malformed free-text fields. Reported instead of being silently
+        replaced with defaults — a typo'd PID must not save as 0xF000."""
+        errors = []
+        pid_text = self.pid_entry.get().strip()
+        if pid_text:
+            try:
+                int(pid_text, 16)
+            except ValueError:
+                errors.append(f"USB Product ID '{pid_text}' is not valid hex")
+        if not self.refresh_disable.get():
+            refresh_text = self.refresh_entry.get().strip()
+            if refresh_text:
+                try:
+                    float(refresh_text)
+                except ValueError:
+                    errors.append(f"Keep-alive interval '{refresh_text}' is not a number")
+        return errors
+
     def _collect_config(self) -> Config:
         name = self.name_entry.get() or "SimInput Button Box"
         pid_text = self.pid_entry.get().strip()
         try:
             pid = int(pid_text, 16) if pid_text else 0xF000
         except ValueError:
-            pid = 0xF000
+            pid = 0xF000  # _input_errors() blocks the save before this matters
 
         debounce = int(self.debounce_slider.get())
         if self.refresh_disable.get():
@@ -396,29 +432,28 @@ class ConfigurePage(ctk.CTkFrame):
             except ValueError:
                 refresh = 1.0
 
-        device = DeviceSettings(name=name, pid=pid, debounce_ms=debounce, inactivity_refresh=refresh)
+        device = DeviceSettings(name=name, pid=pid, debounce_ms=debounce,
+                                inactivity_refresh=refresh, extra=dict(self._device_extra))
 
         bools = [BoolVar(
             id=w["name"].get().strip(), default=bool(w["default"].get()), store=bool(w["store"].get()),
+            extra=dict(w.get("extra", {})),
         ) for w in self._var_widgets]
+        bools += [b for b in self._bool_comments]
 
         axes = []
         for w in self._axis_widgets:
-            slot_text = w["slot"].get()
-            if "Backlight" in slot_text:
-                output: int | str = "BACKLIGHT"
-            else:
-                try:
-                    output = int(slot_text.split("(")[1].rstrip(")"))
-                except (IndexError, ValueError):
-                    output = 1
+            output = w["slot_map"].get(w["slot"].get(), 1)
             axes.append(Axis(
                 id=w["name"].get().strip(), output=output, default=w["default_val"],
                 store=bool(w["store"].get()), backlight=bool(w["backlight"].get()),
+                extra=dict(w.get("extra", {})),
             ))
+        axes += [a for a in self._axis_comments]
 
         rules = self.rule_editor.collect_rules()
-        return Config(device=device, bools=bools, axes=axes, rules=rules)
+        return Config(device=device, bools=bools, axes=axes, rules=rules,
+                      extra=dict(self._config_extra))
 
     def _load_config(self, config: Config):
         self.name_entry.delete(0, "end")
@@ -442,20 +477,27 @@ class ConfigurePage(ctk.CTkFrame):
             self.refresh_entry.delete(0, "end")
             self.refresh_entry.insert(0, str(config.device.inactivity_refresh))
 
+        self._config_extra = dict(config.extra)
+        self._device_extra = dict(config.device.extra)
+
         for w in self._var_widgets:
             w["frame"].destroy()
         self._var_widgets.clear()
-        for bv in config.bools:
+        self._bool_comments = [b for b in config.bools if b.comment]
+        editable_bools = [b for b in config.bools if not b.comment]
+        for bv in editable_bools:
             self._add_var(bv)
-        if not config.bools:
+        if not editable_bools:
             self._vars_empty.grid()
 
         for w in self._axis_widgets:
             w["frame"].destroy()
         self._axis_widgets.clear()
-        for ax in config.axes:
+        self._axis_comments = [a for a in config.axes if a.comment]
+        editable_axes = [a for a in config.axes if not a.comment]
+        for ax in editable_axes:
             self._add_axis(ax)
-        if not config.axes:
+        if not editable_axes:
             self._axes_empty.grid()
 
         self.rule_editor.load_rules(config.rules)
@@ -516,8 +558,12 @@ class ConfigurePage(ctk.CTkFrame):
         self.app.run_operation("Reading configuration", work, on_success=on_success, success_message="Loaded")
 
     def _save_config(self):
+        input_errors = self._input_errors()
+        if input_errors:
+            self.app.show_status("; ".join(input_errors), "error", 8000)
+            return
         config = self._collect_config()
-        errors = validate(config, board_map=self.app.board_map)
+        errors = validate(config, board_map=self.app.board_map, pins=self.app.device_pins)
         if errors:
             msg = "; ".join(str(e) for e in errors[:3])
             if len(errors) > 3:

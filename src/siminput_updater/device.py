@@ -9,7 +9,7 @@ import sys
 import threading
 import time
 from dataclasses import dataclass
-from typing import Any, Callable
+from typing import Any, Callable, Protocol
 
 import serial
 import serial.tools.list_ports
@@ -60,6 +60,10 @@ class FullDeviceInfo(DeviceInfo):
     axes: list[str] | None = None
     rules_count: int = 0
     hash_algo: str = ""
+    protocol: int = 1
+    caps: tuple = ()
+    limits: dict | None = None
+    fault: str = ""
 
 
 ADAFRUIT_VID = 0x239A
@@ -69,8 +73,9 @@ WRITE_TIMEOUT = 5.0
 
 
 def _is_ack(resp: dict) -> bool:
-    """A per-chunk ack: ok plus at most a seq echo. Anything else is a real response."""
-    return resp.get("ok") is True and not (set(resp.keys()) - {"ok", "seq"})
+    """A per-chunk ack: ok plus at most a seq and echoed id. Anything else is
+    a real response."""
+    return resp.get("ok") is True and not (set(resp.keys()) - {"ok", "seq", "id"})
 
 
 class Device:
@@ -89,6 +94,7 @@ class Device:
         self._btn_map: dict[int, int] = {}
         self._serial_number: str | None = None
         self._rxbuf = b""
+        self._req_id = 0
 
     @property
     def connected(self) -> bool:
@@ -134,13 +140,19 @@ class Device:
                 return None
             time.sleep(0.005)
 
-    def _read_response(self, timeout: float = RESPONSE_TIMEOUT, skip_acks: bool = False) -> dict:
+    def _read_response(self, timeout: float = RESPONSE_TIMEOUT, skip_acks: bool = False,
+                       expect_id: int | None = None) -> dict:
         """Read the next real response, discarding noise.
 
         Stray stream frames, garbage lines, and (optionally) bare chunk acks
         are skipped: only a line carrying an explicit "ok" key counts as a
         response. Previously any line was accepted, so a leftover stream frame
         could impersonate a get_config reply and present an empty config.
+
+        With expect_id (protocol 2 firmware echoes request ids), a response
+        carrying a different id is a stale reply to an earlier command and is
+        skipped outright. Responses without an id (older firmware) are
+        accepted as before.
         """
         deadline = time.monotonic() + timeout
         while True:
@@ -158,13 +170,16 @@ class Device:
                 continue
             if not isinstance(resp, dict) or "ok" not in resp:
                 continue  # stream frame or garbage — not a command response
+            if (expect_id is not None and "id" in resp
+                    and resp["id"] != expect_id and not _is_ack(resp)):
+                continue  # stale reply to an earlier request
             if skip_acks and _is_ack(resp):
                 continue
             if not resp.get("ok", False) and "error" in resp:
                 raise DeviceError(resp["error"])
             return resp
         # Drop whatever arrives late so it can't be taken for the next
-        # command's response (responses carry no request identity).
+        # command's response.
         self._flush_input()
         raise DeviceTimeout("No response from device")
 
@@ -183,8 +198,12 @@ class Device:
         if not self._port or not self._port.is_open:
             raise DeviceError("Not connected")
         with self._lock:
+            self._req_id += 1
+            rid = self._req_id
+            msg = dict(msg)
+            msg["id"] = rid
             self._write_line(json.dumps(msg).encode("utf-8") + b"\n")
-            return self._read_response(timeout, skip_acks=skip_acks)
+            return self._read_response(timeout, skip_acks=skip_acks, expect_id=rid)
 
     def _check_acks(self):
         """Consume pending complete ack lines without blocking.
@@ -510,6 +529,10 @@ class Device:
             axes=resp.get("axes"),
             rules_count=resp.get("rules_count", 0),
             hash_algo=resp.get("hash", ""),
+            protocol=resp.get("protocol", 1),
+            caps=tuple(resp.get("caps") or ()),
+            limits=resp.get("limits"),
+            fault=resp.get("fault", ""),
         )
 
     def get_config(self) -> dict:
@@ -682,8 +705,10 @@ class Device:
         if not self._port or not self._port.is_open:
             raise DeviceError("Not connected")
         with self._lock:
-            self._write_line(json.dumps({"cmd": "update_commit"}).encode("utf-8") + b"\n")
-            resp = self._read_response(timeout=10.0, skip_acks=True)
+            self._req_id += 1
+            rid = self._req_id
+            self._write_line(json.dumps({"cmd": "update_commit", "id": rid}).encode("utf-8") + b"\n")
+            resp = self._read_response(timeout=10.0, skip_acks=True, expect_id=rid)
             return resp.get("committed", [])
 
     def update_abort(self) -> bool:
@@ -728,8 +753,10 @@ class Device:
 
         with self._lock:
             self._check_acks()
-            self._write_line(b'{"done":true}\n')
-            resp = self._read_response(timeout=10.0, skip_acks=True)
+            self._req_id += 1
+            rid = self._req_id
+            self._write_line(json.dumps({"done": True, "id": rid}).encode("utf-8") + b"\n")
+            resp = self._read_response(timeout=10.0, skip_acks=True, expect_id=rid)
             if not resp.get("written"):
                 raise DeviceError(resp.get("error", "File write failed"))
 
@@ -841,5 +868,55 @@ class Device:
             seq += 1
         with self._lock:
             self._check_acks()
-            self._write_line(b'{"done":true}\n')
-            return self._read_response(timeout=10.0, skip_acks=True)
+            self._req_id += 1
+            rid = self._req_id
+            self._write_line(json.dumps({"done": True, "id": rid}).encode("utf-8") + b"\n")
+            return self._read_response(timeout=10.0, skip_acks=True, expect_id=rid)
+
+
+class DeviceLike(Protocol):
+    """The interface both Device and MockDevice must present.
+
+    The app is verified with --mock, so a mock that silently drifts from the
+    real class hides bugs until they hit hardware. Static checkers (and the
+    parity test in tests/) hold both implementations to this surface.
+    """
+
+    @property
+    def connected(self) -> bool: ...
+
+    @property
+    def info(self) -> DeviceInfo | None: ...
+
+    def ensure_keepalive(self) -> None: ...
+
+    def connect(self, port_name: str) -> DeviceInfo: ...
+
+    def disconnect(self) -> None: ...
+
+    def ping(self) -> DeviceInfo: ...
+
+    def get_info(self) -> FullDeviceInfo: ...
+
+    def get_config(self) -> dict: ...
+
+    def set_config(self, config: dict) -> dict: ...
+
+    def start_stream(self, callback: Callable[[dict], None], interval_ms: int = 50,
+                     on_end: Callable[[], None] | None = None) -> None: ...
+
+    def stop_stream(self) -> None: ...
+
+    def update_begin(self) -> None: ...
+
+    def update_commit(self) -> list[str]: ...
+
+    def update_abort(self) -> bool: ...
+
+    def file_write(self, path: str, data: bytes,
+                   progress: Callable[[int, int], None] | None = None,
+                   should_cancel: Callable[[], bool] | None = None) -> None: ...
+
+    def reboot(self, hard: bool = False) -> None: ...
+
+    def wait_for_reconnect(self, port_name: str, timeout: float = 15.0) -> DeviceInfo: ...

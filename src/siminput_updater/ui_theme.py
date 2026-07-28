@@ -68,8 +68,18 @@ def resolve(color: tuple[str, str] | str) -> str:
     return color[0] if ctk.get_appearance_mode() == "Light" else color[1]
 
 
+# Fonts are cached: every CTkFont creates a named Tk font, and the rule list
+# rebuilds hundreds of labels per structural edit — a fresh font object per
+# label made every add/move/delete click allocate hundreds of Tk fonts.
+_font_cache: dict[tuple, ctk.CTkFont] = {}
+
+
 def font(size: int = 13, weight: str = "normal") -> ctk.CTkFont:
-    return ctk.CTkFont(size=size, weight=weight)
+    key = ("", size, weight)
+    f = _font_cache.get(key)
+    if f is None:
+        f = _font_cache[key] = ctk.CTkFont(size=size, weight=weight)
+    return f
 
 
 # "monospace" is an alias only fontconfig (Linux) understands; Windows and
@@ -78,7 +88,11 @@ MONO_FAMILY = {"win32": "Consolas", "darwin": "Menlo"}.get(sys.platform, "monosp
 
 
 def mono(size: int = 12, weight: str = "normal") -> ctk.CTkFont:
-    return ctk.CTkFont(family=MONO_FAMILY, size=size, weight=weight)
+    key = (MONO_FAMILY, size, weight)
+    f = _font_cache.get(key)
+    if f is None:
+        f = _font_cache[key] = ctk.CTkFont(family=MONO_FAMILY, size=size, weight=weight)
+    return f
 
 
 def primary_button(master, text: str, command=None, **kw) -> ctk.CTkButton:

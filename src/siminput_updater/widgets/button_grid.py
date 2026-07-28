@@ -35,10 +35,13 @@ class ButtonGrid(ctk.CTkFrame):
         )
         self.canvas.pack(padx=2, pady=2)
 
+        # Buttons are B0..B127 (report bits 0..127); the old grid rendered
+        # 1..128, and B128 does not exist. B0 is real but never driven by the
+        # firmware, so its cell is drawn muted.
         self._cells: dict[int, int] = {}
         for row in range(ROWS):
             for col in range(COLS):
-                btn_num = row * COLS + col + 1
+                btn_num = row * COLS + col
                 x = PAD + col * (cell + PAD)
                 y = PAD + row * (cell + PAD)
                 rect = self.canvas.create_rectangle(
@@ -47,10 +50,14 @@ class ButtonGrid(ctk.CTkFrame):
                 )
                 self.canvas.create_text(
                     x + cell / 2, y + cell / 2,
-                    text=str(btn_num), fill=t.resolve(t.TEXT_DIM), font=self._font,
-                    tags=f"text_{btn_num}",
+                    text=str(btn_num), fill=t.resolve(self._num_color(btn_num)),
+                    font=self._font, tags=f"text_{btn_num}",
                 )
                 self._cells[btn_num] = rect
+
+    @staticmethod
+    def _num_color(btn: int):
+        return t.TEXT_MUTED if btn == 0 else t.TEXT_DIM
 
     def _paint(self, btn: int, on: bool):
         if on:
@@ -58,7 +65,7 @@ class ButtonGrid(ctk.CTkFrame):
             self.canvas.itemconfig(f"text_{btn}", fill=t.resolve(t.CELL_ON_TEXT))
         else:
             self.canvas.itemconfig(self._cells[btn], fill=t.resolve(t.CELL_OFF), outline=t.resolve(t.CELL_BORDER))
-            self.canvas.itemconfig(f"text_{btn}", fill=t.resolve(t.TEXT_DIM))
+            self.canvas.itemconfig(f"text_{btn}", fill=t.resolve(self._num_color(btn)))
 
     def retheme(self):
         """Re-resolve canvas colours after a light/dark switch."""
