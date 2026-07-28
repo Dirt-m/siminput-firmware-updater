@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import random
+import re
 import threading
 import time
 from typing import Callable
@@ -10,6 +11,7 @@ from .config_model import Config, pins_for_board, validate
 from .device import DeviceError, DeviceInfo, FullDeviceInfo
 
 MOCK_BOARD_MAP = "rev1"
+MOCK_VERSION = "2.3.0-mock"
 
 MOCK_CONFIG = {
     "device": {"name": "Mock SimInput Box", "pid": 61440, "debounce_ms": 10},
@@ -35,6 +37,7 @@ MOCK_CONFIG = {
 class MockDevice:
     def __init__(self, config: dict | None = None):
         self._config = config or copy.deepcopy(MOCK_CONFIG)
+        self._version = MOCK_VERSION
         self._streaming = False
         self._stream_thread: threading.Thread | None = None
         self._stream_callback: Callable[[dict], None] | None = None
@@ -77,7 +80,7 @@ class MockDevice:
             return []
         return [DeviceInfo(
             product="SIMINPUT",
-            version="2.3.0-mock",
+            version=MOCK_VERSION,
             name="Mock SimInput Box",
             pid=0xF000,
             port="MOCK",
@@ -85,10 +88,11 @@ class MockDevice:
         )]
 
     def connect(self, port_name: str) -> DeviceInfo:
+        self.disconnect()  # like the real Device: connect always starts clean
         self._connected = True
         self._info = DeviceInfo(
             product="SIMINPUT",
-            version="2.3.0-mock",
+            version=self._version,
             name=self._config.get("device", {}).get("name", "Mock SimInput Box"),
             pid=self._config.get("device", {}).get("pid", 0xF000),
             port=port_name,
@@ -104,7 +108,7 @@ class MockDevice:
     def ping(self) -> DeviceInfo:
         return DeviceInfo(
             product="SIMINPUT",
-            version="2.3.0-mock",
+            version=self._version,
             name=self._config.get("device", {}).get("name", "Mock SimInput Box"),
             pid=self._config.get("device", {}).get("pid", 0xF000),
             port="MOCK",
@@ -114,7 +118,7 @@ class MockDevice:
     def get_info(self) -> FullDeviceInfo:
         return FullDeviceInfo(
             product="SIMINPUT",
-            version="2.3.0-mock",
+            version=self._version,
             name=self._config.get("device", {}).get("name", "Mock SimInput Box"),
             pid=self._config.get("device", {}).get("pid", 0xF000),
             port="MOCK",
@@ -130,18 +134,20 @@ class MockDevice:
             bools=[b["id"] for b in self._config.get("bools", [])],
             axes=[a["id"] for a in self._config.get("axes", [])],
             rules_count=len(self._config.get("rules", [])),
+            hash_algo="sha256",
         )
 
     def get_config(self) -> dict:
         return copy.deepcopy(self._config)
 
-    def set_config(self, config: dict) -> None:
+    def set_config(self, config: dict) -> dict:
         cfg = Config.from_dict(config)
         errs = validate(cfg, board_map=MOCK_BOARD_MAP)
         if errs:
             raise DeviceError(str(errs[0]))
         self._config = copy.deepcopy(config)
         self._init_state()
+        return {"ok": True}  # the mock applies instantly, no reboot
 
     def validate_config(self, config: dict) -> None:
         cfg = Config.from_dict(config)
@@ -157,7 +163,12 @@ class MockDevice:
             "pins": dict(self._pins),
         }
 
-    def start_stream(self, callback: Callable[[dict], None], interval_ms: int = 50):
+    def start_stream(
+        self,
+        callback: Callable[[dict], None],
+        interval_ms: int = 50,
+        on_end: Callable[[], None] | None = None,
+    ):
         self.stop_stream()
         self._stream_callback = callback
         self._streaming = True
@@ -165,6 +176,8 @@ class MockDevice:
         self._stream_thread.start()
 
     def stop_stream(self):
+        if not self._streaming:
+            return
         self._streaming = False
         if self._stream_thread:
             self._stream_thread.join(timeout=2.0)
@@ -198,29 +211,40 @@ class MockDevice:
             self._axes[idx] = max(0, min(65535, self._axes[idx] + delta))
 
     def update_begin(self) -> None:
-        if self._update_staging is not None:
-            raise DeviceError("update already in progress")
+        # Matches firmware ≥2.5.0: stale staging from a dead session is
+        # discarded and the update starts clean.
         self._update_staging = {}
 
     def update_commit(self) -> list[str]:
         if self._update_staging is None:
             raise DeviceError("no update in progress")
         committed = list(self._update_staging.keys())
+        # Adopt the version of the flashed firmware so the post-update version
+        # check exercises the same path as real hardware.
+        handler = self._update_staging.get("lib/serial_handler.py")
+        if handler:
+            m = re.search(rb'FW_VERSION = "([^"]+)"', handler)
+            if m:
+                self._version = m.group(1).decode()
         self._update_staging = None
         return committed
 
-    def update_abort(self) -> None:
+    def update_abort(self) -> bool:
         self._update_staging = None
+        return True
 
     def file_write(
         self,
         path: str,
         data: bytes,
         progress: Callable[[int, int], None] | None = None,
+        should_cancel: Callable[[], bool] | None = None,
     ) -> None:
         total = len(data)
         sent = 0
         while sent < total:
+            if should_cancel and should_cancel():
+                raise DeviceError("Cancelled during file transfer")
             chunk = min(2048, total - sent)
             sent += chunk
             if progress:
@@ -232,7 +256,8 @@ class MockDevice:
     def file_read(self, path: str) -> bytes:
         return b"# mock file content\n"
 
-    def reboot(self) -> None:
+    def reboot(self, hard: bool = False) -> None:
+        self.stop_stream()
         self._connected = False
         self._info = None
 

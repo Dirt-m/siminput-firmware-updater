@@ -319,12 +319,15 @@ class ConfigurePage(ctk.CTkFrame):
 
         ctk.CTkLabel(frame, text="Default", font=t.font(12), text_color=t.TEXT_DIM).grid(
             row=1, column=0, padx=(12, 6), pady=10)
-        default_slider = _slider(frame, from_=0, to=65535, number_of_steps=256)
+        # No number_of_steps: a stepped slider snaps set() values to multiples
+        # of 65535/steps, silently corrupting loaded defaults on every
+        # read/save round trip (30000 became 29951). The authoritative value
+        # lives in the widget dict ("default_val"); the slider is input only.
+        default_slider = _slider(frame, from_=0, to=65535)
         default_slider.set(ax.default)
         default_slider.grid(row=1, column=1, columnspan=2, padx=6, pady=10, sticky="ew")
         default_lbl = ctk.CTkLabel(frame, text=str(ax.default), width=56, font=t.mono(11), text_color=t.TEXT)
         default_lbl.grid(row=1, column=3, padx=6, pady=10, sticky="w")
-        default_slider.configure(command=lambda v, l=default_lbl: self._on_axis_default(v, l))
 
         store_cb = _check(frame, "Remember", command=self._mark_dirty)
         store_cb.grid(row=1, column=4, padx=12, pady=10)
@@ -335,14 +338,18 @@ class ConfigurePage(ctk.CTkFrame):
         if ax.backlight:
             bl_cb.select()
 
-        self._axis_widgets.append({
+        widgets = {
             "frame": frame, "name": name_entry, "slot": slot_menu,
-            "default": default_slider, "default_lbl": default_lbl, "store": store_cb, "backlight": bl_cb,
-        })
+            "default": default_slider, "default_val": int(ax.default),
+            "default_lbl": default_lbl, "store": store_cb, "backlight": bl_cb,
+        }
+        default_slider.configure(command=lambda v, w=widgets: self._on_axis_default(v, w))
+        self._axis_widgets.append(widgets)
         self._mark_dirty()
 
-    def _on_axis_default(self, value, label):
-        label.configure(text=str(int(value)))
+    def _on_axis_default(self, value, widgets):
+        widgets["default_val"] = round(value)
+        widgets["default_lbl"].configure(text=str(widgets["default_val"]))
         self._mark_dirty()
 
     def _remove_axis(self, frame):
@@ -406,7 +413,7 @@ class ConfigurePage(ctk.CTkFrame):
                 except (IndexError, ValueError):
                     output = 1
             axes.append(Axis(
-                id=w["name"].get().strip(), output=output, default=int(w["default"].get()),
+                id=w["name"].get().strip(), output=output, default=w["default_val"],
                 store=bool(w["store"].get()), backlight=bool(w["backlight"].get()),
             ))
 
@@ -421,7 +428,10 @@ class ConfigurePage(ctk.CTkFrame):
         self.debounce_slider.set(config.device.debounce_ms)
         self.debounce_value.configure(text=f"{config.device.debounce_ms} ms")
 
-        if config.device.inactivity_refresh is False:
+        # The firmware treats null the same as false (keep-alive disabled) —
+        # both must load as "Disabled", not as the literal string "None" that
+        # would later be coerced to 1.0 and silently re-enable keep-alive.
+        if config.device.inactivity_refresh in (False, None):
             self.refresh_disable.select()
             self.refresh_entry.configure(state="normal")
             self.refresh_entry.delete(0, "end")
@@ -475,8 +485,20 @@ class ConfigurePage(ctk.CTkFrame):
 
     # ----------------------------------------------------------- actions
 
+    def _confirm_discard(self, what: str) -> bool:
+        if not self._dirty:
+            return True
+        from tkinter import messagebox
+        return messagebox.askyesno(
+            "Unsaved changes",
+            f"The configuration has unsaved changes.\n\n{what} will discard them — continue?",
+        )
+
     def _read_config(self):
         if not self.app.device.connected:
+            self.app.show_status("No device connected", "error")
+            return
+        if not self._confirm_discard("Reading from the device"):
             return
 
         def work(ctx):
@@ -503,24 +525,57 @@ class ConfigurePage(ctk.CTkFrame):
             self.app.show_status(f"Validation errors: {msg}", "error", 8000)
             return
         if not self.app.device.connected:
+            self.app.show_status("No device connected", "error")
             return
 
         payload = config.to_dict()
+        device = self.app.device
+        old_info = device.info
+        port_name = old_info.port if old_info else ""
+        identity_changed = bool(old_info) and (
+            payload.get("device", {}).get("name") != old_info.name
+            or payload.get("device", {}).get("pid") != old_info.pid
+        )
 
         def work(ctx):
             ctx.status("Writing configuration to device…")
             ctx.log("set_config")
             ctx.check_cancel()
-            self.app.device.set_config(payload)
+            resp = device.set_config(payload)
             ctx.log("Configuration written")
+            # The device reboots to apply the config. Ride out the restart
+            # inside the operation so the scan loop (paused while an operation
+            # runs) never sees the drop and reports a spurious disconnect.
+            if isinstance(resp, dict) and resp.get("rebooting") and port_name:
+                ctx.status("Device is rebooting to apply the configuration…")
+                device.handle_reboot_disconnect()
+                info = device.wait_for_reconnect(port_name)
+                ctx.log(f"Device reconnected: {info.name}")
+                full = None
+                try:
+                    full = device.get_info()
+                except Exception:
+                    pass
+                return info, full
+            return None
 
-        def on_success(_):
+        def on_success(result):
             self._clear_dirty()
+            if result is not None:
+                info, full = result
+                self.app.notify_connected(info, full)
             self.app.show_status("Configuration saved to device", "success")
+            if identity_changed:
+                self.app.show_status(
+                    "USB name/PID changes take effect after unplugging the device",
+                    "info", 8000,
+                )
 
         self.app.run_operation("Saving configuration", work, on_success=on_success, success_message="Saved")
 
     def _import_json(self):
+        if not self._confirm_discard("Importing a file"):
+            return
         path = filedialog.askopenfilename(
             title="Import Configuration",
             filetypes=[("JSON files", "*.json"), ("All files", "*.*")])

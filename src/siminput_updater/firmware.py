@@ -54,11 +54,19 @@ def load_firmware_zip(zip_path: str) -> FirmwarePackage:
                 raise FirmwareError("Missing manifest.json in firmware package")
 
             manifest = json.loads(zf.read("manifest.json"))
+            if not isinstance(manifest, dict):
+                raise FirmwareError("manifest.json must contain a JSON object")
 
             fw_version = manifest.get("firmware_version", "unknown")
 
+            entries = manifest.get("files", [])
+            if not isinstance(entries, list) or not entries:
+                raise FirmwareError("Manifest lists no files — not a usable package")
+
             files: list[FirmwareFile] = []
-            for entry in manifest.get("files", []):
+            for entry in entries:
+                if not isinstance(entry, dict):
+                    raise FirmwareError("Malformed manifest: file entries must be objects")
                 path = entry["path"]
                 expected_sha = entry["sha256"]
                 expected_size = entry["size"]
@@ -69,13 +77,16 @@ def load_firmware_zip(zip_path: str) -> FirmwarePackage:
                 if path not in zf.namelist():
                     raise FirmwareError(f"File listed in manifest but missing from zip: {path}")
 
-                data = zf.read(path)
-
-                if len(data) != expected_size:
+                # Check the declared size against the zip directory before
+                # decompressing, so a bogus entry can't balloon in memory.
+                stored_size = zf.getinfo(path).file_size
+                if stored_size != expected_size:
                     raise FirmwareError(
                         f"{path}: size mismatch (manifest says {expected_size}, "
-                        f"actual {len(data)})"
+                        f"actual {stored_size})"
                     )
+
+                data = zf.read(path)
 
                 actual_sha = hashlib.sha256(data).hexdigest()
                 if actual_sha != expected_sha:
@@ -96,10 +107,17 @@ def load_firmware_zip(zip_path: str) -> FirmwarePackage:
                 files=files,
             )
 
+    except FirmwareError:
+        raise
     except zipfile.BadZipFile:
         raise FirmwareError("Not a valid zip file")
     except KeyError as e:
         raise FirmwareError(f"Missing required field in manifest: {e}")
+    except Exception as e:
+        # Corrupt manifests, unreadable files, encrypted zips, bad deflate
+        # streams: everything must surface as FirmwareError — in the windowed
+        # build an uncaught exception here is completely invisible.
+        raise FirmwareError(f"Could not read firmware package: {e}")
 
 
 def upload_order(files: list[FirmwareFile]) -> list[FirmwareFile]:
@@ -156,16 +174,22 @@ def perform_update(
     total_bytes = sum(f.size for f in ordered)
     uploaded_bytes = 0
 
-    # Older firmware has no update_begin — probing is the only reliable check,
-    # since the client class always has the method.
+    # Older firmware has no update_begin — probe for it, but only fall back
+    # to direct (non-staged) writes when the device explicitly says the
+    # command is unknown. Any other failure — a timeout, "already in
+    # progress", a serial error — aborts the update: falling back on those
+    # used to end with every file silently diverted into the device's staging
+    # directory and a success report for a flash that changed nothing.
     transactional = False
-    if hasattr(device, "update_begin"):
-        try:
-            device.update_begin()
-            transactional = True
-            status("Starting transactional update (staged writes)...")
-        except Exception as e:
-            status(f"Staged update unavailable ({e}) — writing files directly")
+    try:
+        device.update_begin()
+        transactional = True
+        status("Starting transactional update (staged writes)...")
+    except Exception as e:
+        if "unknown command" in str(e).lower():
+            status("Firmware has no staged updates — writing files directly")
+        else:
+            raise FirmwareError(f"Could not start staged update: {e}")
 
     try:
         for f in ordered:
@@ -177,7 +201,11 @@ def perform_update(
                 if on_progress:
                     on_progress(uploaded_bytes + sent, total_bytes, f.path)
 
-            device.file_write(f.path, f.data, progress=file_progress)
+            device.file_write(
+                f.path, f.data,
+                progress=file_progress,
+                should_cancel=should_cancel,
+            )
             uploaded_bytes += f.size
             status(f"  {f.path} written successfully")
 
@@ -188,28 +216,43 @@ def perform_update(
     except Exception:
         if transactional:
             status("Upload failed — aborting staged update...")
-            device.update_abort()
-            status("  Staged files discarded, device unchanged")
+            if device.update_abort():
+                status("  Staged files discarded, device unchanged")
+            else:
+                status("  Warning: could not confirm the abort — the device may "
+                       "still hold staged files (they are discarded on its next update)")
+        else:
+            status("  Warning: the device may be partially updated — re-run the "
+                   "update before unplugging")
         raise
 
     status("Rebooting device...")
     port_name = device.info.port if device.info else ""
-    device.reboot()
+    # Hard reset where supported: a soft reload never re-runs boot.py, so a
+    # freshly flashed boot.py (USB name/PID) would not take effect until the
+    # user physically unplugs the box.
+    try:
+        device.reboot(hard=True)
+    except TypeError:
+        device.reboot()
 
     status("Waiting for device to restart...")
     try:
         info = device.wait_for_reconnect(port_name)
         status(f"Device reconnected: {info.name} v{info.version}")
-        if info.version == package.firmware_version:
-            status(f"Update successful: now running v{info.version}")
-        else:
-            status(
-                f"Warning: expected v{package.firmware_version}, "
-                f"device reports v{info.version}"
-            )
-        return info.version
     except Exception as e:
         status(f"Could not reconnect: {e}")
         if backup_path:
             status(f"Your config backup is at {backup_path}")
         raise
+
+    if info.version != package.firmware_version:
+        # A version mismatch after a "successful" flash means the update did
+        # not actually land (e.g. files staged but never committed). Fail
+        # loudly instead of logging a warning nobody reads.
+        raise FirmwareError(
+            f"Device reports v{info.version} after the update, expected "
+            f"v{package.firmware_version} — the update did not take effect"
+        )
+    status(f"Update successful: now running v{info.version}")
+    return info.version

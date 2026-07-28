@@ -20,6 +20,8 @@ class BusyOverlay(ctk.CTkFrame):
         super().__init__(master, fg_color=t.BG, corner_radius=t.RADIUS)
         self._on_cancel: Callable[[], None] | None = None
         self._spinner_running = False
+        self._hide_after_id: str | None = None
+        self._force_close_after_id: str | None = None
 
         # Centred card
         self.card = ctk.CTkFrame(
@@ -67,6 +69,10 @@ class BusyOverlay(ctk.CTkFrame):
     # -- lifecycle --
 
     def show(self, title: str, on_cancel: Callable[[], None], indeterminate: bool = True):
+        # A finished operation's pending auto-hide must never dismiss the
+        # overlay of the operation that started after it.
+        self._cancel_timer("_hide_after_id")
+        self._cancel_timer("_force_close_after_id")
         self._on_cancel = on_cancel
         self.title_lbl.configure(text=title, text_color=t.TEXT)
         self.status_lbl.configure(text="Starting…", text_color=t.TEXT_DIM)
@@ -92,8 +98,19 @@ class BusyOverlay(ctk.CTkFrame):
         self.lift()
 
     def hide(self):
+        self._cancel_timer("_hide_after_id")
+        self._cancel_timer("_force_close_after_id")
         self._stop_spinner()
         self.place_forget()
+
+    def _cancel_timer(self, attr: str):
+        after_id = getattr(self, attr)
+        if after_id is not None:
+            try:
+                self.after_cancel(after_id)
+            except Exception:
+                pass
+            setattr(self, attr, None)
 
     # -- live updates (call on main thread) --
 
@@ -114,14 +131,16 @@ class BusyOverlay(ctk.CTkFrame):
     # -- terminal states --
 
     def finish_success(self, message: str = "Done", auto_hide_ms: int = 650):
+        self._cancel_timer("_force_close_after_id")
         self._stop_spinner()
         self.progress.configure(progress_color=t.SUCCESS)
         self.progress.set(1.0)
         self.status_lbl.configure(text=message, text_color=t.SUCCESS)
         self.action_btn.configure(state="disabled")
-        self.after(auto_hide_ms, self.hide)
+        self._hide_after_id = self.after(auto_hide_ms, self.hide)
 
     def finish_error(self, message: str):
+        self._cancel_timer("_force_close_after_id")
         self._stop_spinner()
         self.progress.configure(progress_color=t.ERROR)
         self.status_lbl.configure(text=message, text_color=t.ERROR)
@@ -129,6 +148,7 @@ class BusyOverlay(ctk.CTkFrame):
         self._show_close()
 
     def finish_cancelled(self, message: str = "Aborted"):
+        self._cancel_timer("_force_close_after_id")
         self._stop_spinner()
         self.progress.configure(progress_color=t.WARN)
         self.status_lbl.configure(text=message, text_color=t.WARN)
@@ -148,6 +168,20 @@ class BusyOverlay(ctk.CTkFrame):
         self.status_lbl.configure(text="Aborting…", text_color=t.WARN)
         if self._on_cancel:
             self._on_cancel()
+        # Escape hatch: if the worker is stuck in blocking I/O and never
+        # honours the cancel, offer a way out after a few seconds.
+        self._force_close_after_id = self.after(5000, self._offer_force_close)
+
+    def _offer_force_close(self):
+        self._force_close_after_id = None
+        if self.action_btn.cget("state") == "disabled":
+            self.append_log("Still aborting — Force close hides this window; "
+                            "the operation may keep running in the background.")
+            self.action_btn.configure(
+                text="Force close", state="normal",
+                fg_color=t.SURFACE_3, hover_color=t.HOVER,
+                text_color=t.TEXT, border_width=0, command=self.hide,
+            )
 
     def _stop_spinner(self):
         if self._spinner_running:

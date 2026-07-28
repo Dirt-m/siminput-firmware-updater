@@ -26,6 +26,8 @@ class DevicePage(ctk.CTkFrame):
         super().__init__(parent, fg_color="transparent")
         self.app = app
         self._streaming = False
+        self._pending_state: dict | None = None
+        self._update_scheduled = False
 
         self.grid_columnconfigure(0, weight=1)
         self.grid_rowconfigure(1, weight=1)
@@ -141,7 +143,12 @@ class DevicePage(ctk.CTkFrame):
     def _on_connection_changed(self, connected: bool):
         self._sync_connection_view()
         if connected:
-            self._start_stream()
+            # Only stream while this page is actually visible. Starting a
+            # hidden stream leaves (on Windows, where monitoring runs over
+            # serial) a reader thread consuming the very responses the other
+            # pages' commands are waiting for.
+            if self.app._current_page == "device":
+                self._start_stream()
         else:
             self._stop_stream()
 
@@ -168,6 +175,10 @@ class DevicePage(ctk.CTkFrame):
         if full:
             self._stat_labels["cp"].configure(text=full.circuitpython or "—")
             self._stat_labels["nvm"].configure(text=f"{full.nvm_size}B" if full.nvm_size else "—")
+        else:
+            # Don't let a previous device's values masquerade as this one's.
+            self._stat_labels["cp"].configure(text="—")
+            self._stat_labels["nvm"].configure(text="—")
 
     # --------------------------------------------------------------- stream
 
@@ -175,7 +186,9 @@ class DevicePage(ctk.CTkFrame):
         if self._streaming or not self.app.device.connected:
             return
         try:
-            self.app.device.start_stream(self._on_state_update, interval_ms=50)
+            self.app.device.start_stream(
+                self._on_state_update, interval_ms=50, on_end=self._on_stream_died,
+            )
             self._streaming = True
         except Exception as e:
             self.app.show_status(f"Stream error: {e}", "error")
@@ -189,11 +202,40 @@ class DevicePage(ctk.CTkFrame):
             pass
         self._streaming = False
 
-    def _on_state_update(self, state: dict):
-        self.after(0, lambda: self._apply_state(state))
+    def _on_stream_died(self):
+        """The reader thread exited unexpectedly (device vanished, evdev node
+        closed). Reset so the monitor can restart instead of freezing."""
+        def retry():
+            if self.app.device.connected and self.app._current_page == "device":
+                self._start_stream()
 
-    def _apply_state(self, state: dict):
-        if not self._streaming:
+        def apply():
+            self._streaming = False
+            if self.app.device.connected and self.app._current_page == "device":
+                self.app.show_status("Live monitor stopped — restarting…", "info")
+                # Delayed retry, not immediate: a dead device would otherwise
+                # spin start/die cycles as fast as the event loop allows.
+                self.after(1000, retry)
+        try:
+            self.after(0, apply)
+        except RuntimeError:
+            pass
+
+    def _on_state_update(self, state: dict):
+        # Coalesce: the evdev reader can fire per input event (hundreds of Hz);
+        # keep only the latest state and at most one queued UI update.
+        self._pending_state = state
+        if not self._update_scheduled:
+            self._update_scheduled = True
+            try:
+                self.after(0, self._apply_pending)
+            except RuntimeError:
+                self._update_scheduled = False
+
+    def _apply_pending(self):
+        self._update_scheduled = False
+        state = self._pending_state
+        if state is None or not self._streaming:
             return
         self.button_grid.update_buttons(set(state.get("b", [])))
 

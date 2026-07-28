@@ -52,6 +52,9 @@ class App(ctk.CTk):
         self._known_ports: set[str] = set()    # ports seen by the last presence tick
         self._rescan_in = 0                    # ticks until the next forced full probe
         self._cooldown: dict[str, int] = {}    # port -> ticks to skip auto-connect
+        self._fail_counts: dict[str, int] = {}  # port -> consecutive failed connects
+        self._operation_active = False         # a run_operation is in flight
+        self._closing = False
 
         self.grid_columnconfigure(1, weight=1)
         self.grid_rowconfigure(1, weight=1)
@@ -62,9 +65,41 @@ class App(ctk.CTk):
 
         self.overlay = BusyOverlay(self)
 
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
+        # OS-level light/dark switches re-theme CTk widgets automatically but
+        # not the plain-tk canvases — hook the tracker so those follow too.
+        try:
+            ctk.AppearanceModeTracker.add(self._on_appearance_changed)
+        except Exception:
+            pass
+
         self._show_page("device")
         self._refresh_connection_view()
         self._scan_tick()
+
+    def _on_close(self):
+        if self._operation_active:
+            from tkinter import messagebox
+            if not messagebox.askyesno(
+                "Operation in progress",
+                "A device operation is still running. Closing now can leave "
+                "the device in a half-updated state.\n\nClose anyway?",
+            ):
+                return
+        page = self.pages.get("configure")
+        if page is not None and getattr(page, "_dirty", False):
+            from tkinter import messagebox
+            if not messagebox.askyesno(
+                "Unsaved changes",
+                "The configuration has unsaved changes that will be lost.\n\nClose anyway?",
+            ):
+                return
+        self._closing = True
+        try:
+            self.device.disconnect()
+        except Exception:
+            pass
+        self.destroy()
 
     def _set_initial_geometry(self):
         """Size to ~70% of the screen (never below 1120x760) and centre.
@@ -219,6 +254,20 @@ class App(ctk.CTk):
         for fn in self._theme_listeners:
             fn()
 
+    def _on_appearance_changed(self, _mode: str):
+        # Called by AppearanceModeTracker (possibly during widget updates) when
+        # the OS theme flips while in "system" mode — defer to the event loop.
+        if self._closing:
+            return
+        def apply():
+            self._sync_theme_button()
+            for fn in self._theme_listeners:
+                fn()
+        try:
+            self.after(0, apply)
+        except Exception:
+            pass
+
     def _sync_theme_button(self):
         # The glyph shows the mode the button switches to.
         self._theme_btn.configure(text="☀" if ctk.get_appearance_mode() == "Dark" else "☾")
@@ -259,9 +308,14 @@ class App(ctk.CTk):
         probe runs only when the port set changes, plus on a slow cadence
         while unconnected so a device that was busy booting gets re-tried.
         """
+        if self._closing:
+            return
         if self._scanning:
             return  # a scan is already running; its result handler reschedules
-        if self._connecting:
+        if self._connecting or self._operation_active:
+            # Never open, ping, or auto-connect ports while an operation (e.g.
+            # a firmware flash with its own reconnect loop) owns the device —
+            # a concurrent connect() on the same Device corrupts the port.
             self.after(SCAN_INTERVAL_MS, self._scan_tick)
             return
         self._scanning = True
@@ -277,26 +331,46 @@ class App(ctk.CTk):
         rescan_due = connected_port is None and self._rescan_in <= 0
 
         def work():
-            self.device.ensure_keepalive()
-            try:
-                ports = self.device.list_ports()
-            except Exception:
-                ports = set()
-            lost = connected_port is not None and connected_port not in ports
+            # The whole body is guarded and always reports back: an uncaught
+            # exception here used to leave _scanning latched True, silently
+            # killing discovery for the rest of the session.
+            ports: set[str] = set()
+            lost = False
             devices = None
-            if lost or ports != known or (rescan_due and ports):
-                skip = set() if lost or not connected_port else {connected_port}
+            try:
                 try:
-                    devices = self.device.discover(skip)
+                    self.device.ensure_keepalive()
                 except Exception:
-                    devices = []
-            self.after(0, lambda: self._on_scan_result(ports, lost, devices))
+                    pass
+                try:
+                    ports = self.device.list_ports()
+                except Exception:
+                    ports = set()
+                lost = connected_port is not None and connected_port not in ports
+                if lost or ports != known or (rescan_due and ports):
+                    skip = set() if lost or not connected_port else {connected_port}
+                    try:
+                        devices = self.device.discover(skip)
+                    except Exception:
+                        devices = []
+            finally:
+                if not self._closing:
+                    try:
+                        self.after(0, lambda: self._on_scan_result(ports, lost, devices))
+                    except Exception:
+                        pass
 
         threading.Thread(target=work, daemon=True).start()
 
     def _on_scan_result(self, ports: set[str], lost: bool, devices):
         self._scanning = False
         self._known_ports = ports
+
+        # A port that vanished gets a clean slate when it comes back.
+        for port in list(self._fail_counts):
+            if port not in ports:
+                del self._fail_counts[port]
+                self._cooldown.pop(port, None)
 
         if lost:
             self.device.disconnect()
@@ -310,7 +384,8 @@ class App(ctk.CTk):
         # Auto-connect when idle — a user with a single box never has to touch
         # the dropdown. discover() puts responding devices first, and ports
         # that just failed to connect sit out a few ticks.
-        if not self.device.connected and not self._connecting:
+        if (not self.device.connected and not self._connecting
+                and not self._operation_active):
             candidates = [d for d in self._found if d.port not in self._cooldown]
             if candidates:
                 self._connect_to(candidates[0].port)
@@ -341,13 +416,20 @@ class App(ctk.CTk):
     def _connect_done(self, info, full):
         self._connecting = False
         self._cooldown.pop(info.port, None)
+        self._fail_counts.pop(info.port, None)
         self.notify_connected(info, full)
         self.show_status(f"Connected to {info.name}", "success")
 
     def _connect_failed(self, port: str, msg: str):
         self._connecting = False
-        self._cooldown[port] = CONNECT_COOLDOWN_TICKS
-        self.show_status(f"Connection failed: {msg}", "error", 6000)
+        # Linear backoff per consecutive failure, capped: a non-SIMINPUT
+        # CircuitPython board (or a box that never answers) must not produce
+        # an endless connect/fail/toast loop every few seconds.
+        fails = self._fail_counts.get(port, 0) + 1
+        self._fail_counts[port] = fails
+        self._cooldown[port] = min(CONNECT_COOLDOWN_TICKS * fails, 60)
+        if fails <= 3:
+            self.show_status(f"Connection failed: {msg}", "error", 6000)
         self._refresh_connection_view()
 
     def _on_select_device(self, label: str):
@@ -358,7 +440,11 @@ class App(ctk.CTk):
             return
         if self.device.connected and self.device.info and self.device.info.port == port:
             return
+        if self._operation_active:
+            self.show_status("Busy with a device operation — try again when it finishes", "info")
+            return
         self._cooldown.pop(port, None)  # an explicit click always tries now
+        self._fail_counts.pop(port, None)
         self._connect_to(port)
 
     # ---------------------------------------------------------- dropdown view
@@ -418,29 +504,49 @@ class App(ctk.CTk):
         """
         cancel = threading.Event()
         ctx = OperationContext(self, cancel)
+        self._operation_active = True  # pause scanning/auto-connect for the duration
         self.overlay.show(title, on_cancel=cancel.set, indeterminate=indeterminate)
+
+        def post(fn):
+            if self._closing:
+                return
+            try:
+                self.after(0, fn)
+            except RuntimeError:
+                pass  # window destroyed while the worker was finishing
 
         def runner():
             try:
                 result = work(ctx)
             except OperationCancelled:
-                self.after(0, self.overlay.finish_cancelled)
+                post(self._finish_operation(self.overlay.finish_cancelled))
                 return
             except Exception as e:  # surface any device/IO error in the overlay
                 msg = str(e) or e.__class__.__name__
-                self.after(0, lambda: self.overlay.finish_error(msg))
+                post(self._finish_operation(lambda: self.overlay.finish_error(msg)))
                 return
             if cancel.is_set():
-                self.after(0, self.overlay.finish_cancelled)
+                post(self._finish_operation(self.overlay.finish_cancelled))
                 return
 
             def done():
                 if on_success:
                     on_success(result)
                 self.overlay.finish_success(success_message)
-            self.after(0, done)
+            post(self._finish_operation(done))
 
         threading.Thread(target=runner, daemon=True).start()
+
+    def _finish_operation(self, fn: Callable[[], None]) -> Callable[[], None]:
+        """Wrap a terminal overlay callback so the operation flag always clears,
+        even if the callback itself raises."""
+        def wrapped():
+            try:
+                fn()
+            finally:
+                self._operation_active = False
+                self._refresh_connection_view()
+        return wrapped
 
     # ---------------------------------------------------------------- toast
 
