@@ -41,6 +41,13 @@ def _fix_linux_scroll():
 
     from customtkinter.windows.widgets.ctk_scrollable_frame import CTkScrollableFrame
 
+    # Newer customtkinter (5.2.3+) handles X11 wheel events natively and
+    # renamed check_if_master_is_canvas, so on those versions these patches
+    # are unnecessary — and the wheel patch would raise AttributeError on
+    # every scroll event. Only patch the old API.
+    if not hasattr(CTkScrollableFrame, "check_if_master_is_canvas"):
+        return
+
     _orig_set_increments = CTkScrollableFrame._set_scroll_increments
 
     def _patched_set_increments(self):
