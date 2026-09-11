@@ -274,6 +274,18 @@ class ConfigurePage(ctk.CTkFrame):
             self._show_tab("Device")
             (self.pid_entry if field == "pid" else self.name_entry).focus_set()
 
+    def _analog_firmware_gap(self, config: Config) -> ValidationError | None:
+        """One clear message when a config with analog rules meets a box whose
+        firmware predates analog support, instead of a per-rule pile-up."""
+        if not config.uses_analog() or self.app.analog_supported:
+            return None
+        info = self.app.device.info
+        version = f"firmware {info.version}" if info else "this firmware"
+        return ValidationError(
+            "config",
+            f"The connected box runs {version}, which has no analog support (2.7.0 or later "
+            "is needed). Update the firmware, or remove the Analog rules, before saving.")
+
     # ------------------------------------------------------- live validation
 
     def _schedule_validate(self):
@@ -295,6 +307,9 @@ class ConfigurePage(ctk.CTkFrame):
             config = self._collect_config()
             errors = validate(config, board_map=self.app.board_map, pins=self.app.device_pins,
                               analog_pins=self.app.analog_pins)
+            firmware_gap = self._analog_firmware_gap(config)
+            if firmware_gap:
+                errors.insert(0, firmware_gap)
 
         rule_errors: dict[int, dict[str, str]] = {}
         bad_vars: set[int] = set()
@@ -701,6 +716,10 @@ class ConfigurePage(ctk.CTkFrame):
             self.rule_editor.cancel_learn()
 
     def _on_live(self, state: dict):
+        if not self.app.analog_supported:
+            # Nothing analog is offered on firmware without the capability,
+            # so nothing analog is shown either.
+            state = {**state, "an": {}}
         self.live_panel.update(state)
         self.rule_editor.on_live_state(state)
 

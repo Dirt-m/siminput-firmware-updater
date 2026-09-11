@@ -239,7 +239,8 @@ class DevicePage(ctk.CTkFrame):
             if i < len(self.axis_bars):
                 self.axis_bars[i].set_value(val)
         self._render_pins(state.get("p") or {})
-        self._render_analog(state.get("an") or {})
+        if getattr(self.app.full_info, "has_analog", False):
+            self._render_analog(state.get("an") or {})
 
     def _render_analog(self, samples: dict):
         names = sorted(samples, key=pin_sort_key)
@@ -248,7 +249,7 @@ class DevicePage(ctk.CTkFrame):
                 bar.destroy()
             self._analog_bars = {}
             for i, name in enumerate(names):
-                bar = AnalogBar(self._analog_rows, name, bar_width=260, bg=t.resolve(t.SURFACE))
+                bar = AnalogBar(self._analog_rows, name, bar_width=170, bg=t.resolve(t.SURFACE))
                 bar.grid(row=i, column=0, sticky="w", pady=3)
                 self._analog_bars[name] = bar
             if names:
