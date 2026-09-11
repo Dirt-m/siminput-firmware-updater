@@ -40,7 +40,7 @@ sudo apt install python3-tk        # Ubuntu / Debian
 
 **Shows your inputs live.** A real-time monitor draws every button and axis at 200 Hz, so you can see exactly what the box is sending.
 
-**Edits your config visually.** Device settings, boolean variables, axes, and input rules, all in a tabbed editor with a drag-to-reorder rule builder.
+**Edits your config visually.** Device settings, boolean variables, axes, and input rules, all in a tabbed editor with a drag-to-reorder rule builder that flags problems as you type.
 
 **Runs a real rule engine.** Seven rule types cover the common cases: Direct Map, All-Off Detector, Toggle Switch, Timed Pulse, Rotary Encoder, Increase Axis, and Decrease Axis. Rules can read the outputs of earlier rules in the same cycle.
 
