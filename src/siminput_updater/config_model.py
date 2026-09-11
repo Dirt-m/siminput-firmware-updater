@@ -680,7 +680,7 @@ def validate(config: Config, board_map: str = "",
             if not r.input:
                 errors.append(ValidationError(f"{path}.input", "An input is required"))
             elif r.input in reserved and r.input not in analog_capable:
-                errors.append(ValidationError(f"{path}.input", f"Pin '{r.input}' is not analog capable on this board"))
+                errors.append(ValidationError(f"{path}.input", f"pin '{r.input}' is not analog capable on this board"))
             elif r.input not in analog_capable:
                 errors.append(ValidationError(f"{path}.input", f"Input '{r.input}' is not an analog pin"))
             # axis checked in the pre-pass above
@@ -719,13 +719,13 @@ def validate(config: Config, board_map: str = "",
             if not r.input:
                 errors.append(ValidationError(f"{path}.input", "An input is required"))
             elif r.input in reserved and r.input not in analog_capable:
-                errors.append(ValidationError(f"{path}.input", f"Pin '{r.input}' is not analog capable on this board"))
+                errors.append(ValidationError(f"{path}.input", f"pin '{r.input}' is not analog capable on this board"))
             elif r.input not in analog_capable and r.input not in axis_ids:
                 errors.append(ValidationError(
                     f"{path}.input", f"Input '{r.input}' must be an analog pin or an axis id"))
             check_output(f"{path}.output", r.output)
             if (r.above is None) == (r.below is None):
-                errors.append(ValidationError(f"{path}.above", "Set exactly one of above / below"))
+                errors.append(ValidationError(f"{path}.above", "set exactly one of above / below"))
             else:
                 key = "above" if r.above is not None else "below"
                 if not _in_range(getattr(r, key)):

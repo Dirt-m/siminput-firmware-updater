@@ -24,6 +24,7 @@ from ..config_model import ANALOG_MAX
 
 REST_SAMPLE_MS = 1500      # how long "Capture center" listens for wobble
 NOISE_MARGIN = 64          # added to the observed wobble (the ADC noise floor)
+RAIL_MARGIN = 0.01         # min/max pulled inward by this share of the travel
 BAR_H = 22
 
 
@@ -32,6 +33,27 @@ def suggest_deadzone(low: int, high: int) -> int:
     floor on top, rounded up to a tidy multiple of 16."""
     span = max(0, high - low) + NOISE_MARGIN
     return ((span + 15) // 16) * 16
+
+
+def calibrated_range(low: int, high: int, rest_spread: int = 0,
+                     center: int | None = None, deadzone: int | None = None) -> tuple[int, int]:
+    """min and max for the rule from the raw extremes seen during calibration.
+
+    The extremes include noise dips, so the filtered value at rest sits a
+    little inside them and the axis would never quite reach 0 or 65535; the
+    firmware's hysteresis then holds it there, because the rail exemption
+    only kicks in once the value actually reaches the rail. Pull both ends
+    inward by about 1 % of the travel, or by the wobble seen at rest if that
+    is larger, so the sensor can hit both rails. A captured center (with its
+    deadzone) is kept strictly inside the result."""
+    span = max(0, high - low)
+    margin = max(round(span * RAIL_MARGIN), int(rest_spread))
+    if center is not None:
+        dz = deadzone or 0
+        margin = min(margin, max(0, center - dz - low - 1), max(0, high - (center + dz) - 1))
+    if 2 * margin >= span:
+        margin = 0
+    return low + margin, high - margin
 
 
 class CalibrateDialog(ctk.CTkToplevel):
@@ -46,6 +68,7 @@ class CalibrateDialog(ctk.CTkToplevel):
         self._seen_high: int | None = None
         self._center: int | None = current.get("center")
         self._deadzone: int | None = current.get("deadzone")
+        self._rest_spread = 0
         self._rest: list[int] | None = None
         self._rest_after: str | None = None
 
@@ -88,7 +111,7 @@ class CalibrateDialog(ctk.CTkToplevel):
         ctk.CTkLabel(rng, text="Travel", font=t.font(12, "bold"), text_color=t.TEXT, anchor="w").grid(
             row=0, column=0, padx=12, pady=(10, 0), sticky="w")
         ctk.CTkLabel(rng, text="Move the sensor through its full travel. The lowest and highest "
-                               "readings become min and max.",
+                               "readings become min and max, pulled in slightly so both ends are reachable.",
                      font=t.font(12), text_color=t.TEXT_DIM, anchor="w", justify="left",
                      wraplength=380).grid(row=1, column=0, columnspan=2, padx=12, pady=(2, 6), sticky="w")
         self._range_lbl = ctk.CTkLabel(rng, text="min —   max —", font=t.mono(12), text_color=t.TEXT, anchor="w")
@@ -214,6 +237,7 @@ class CalibrateDialog(ctk.CTkToplevel):
         if not samples:
             return
         self._center = int(sum(samples) / len(samples))
+        self._rest_spread = max(samples) - min(samples)
         self._deadzone = suggest_deadzone(min(samples), max(samples))
         self._render_center()
         self._render_bar()
@@ -253,12 +277,10 @@ class CalibrateDialog(ctk.CTkToplevel):
     # -------------------------------------------------------------- apply
 
     def result(self) -> dict:
-        return {
-            "min": self._seen_low,
-            "max": self._seen_high,
-            "center": self._center,
-            "deadzone": self._deadzone if self._center is not None else None,
-        }
+        deadzone = self._deadzone if self._center is not None else None
+        lo, hi = calibrated_range(self._seen_low, self._seen_high, self._rest_spread,
+                                  self._center, deadzone)
+        return {"min": lo, "max": hi, "center": self._center, "deadzone": deadzone}
 
     def _apply(self):
         if self._seen_low is None or self._seen_high is None or self._seen_high <= self._seen_low:

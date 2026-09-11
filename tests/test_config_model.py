@@ -219,9 +219,9 @@ class AnalogRules(unittest.TestCase):
             {"type": "THRESHOLD", "input": "A3", "output": "NOPE", "above": 100},
             {"type": "THRESHOLD", "input": "A4", "output": "B5", "above": 70000},
         ]))
-        self.assertIn("rules[0].above: Set exactly one of above / below", errs)
-        self.assertIn("rules[1].above: Set exactly one of above / below", errs)
-        self.assertIn("rules[2].input: Pin 'D1' is not analog capable on this board", errs)
+        self.assertIn("rules[0].above: set exactly one of above / below", errs)
+        self.assertIn("rules[1].above: set exactly one of above / below", errs)
+        self.assertIn("rules[2].input: pin 'D1' is not analog capable on this board", errs)
         self.assertFalse(any(e.startswith("rules[3]") for e in errs), errs)
         self.assertIn("rules[4].output: Unknown output 'NOPE'", errs)
         self.assertIn("rules[5].above: threshold must be an integer 0-65535", errs)
@@ -231,7 +231,7 @@ class AnalogRules(unittest.TestCase):
         self.assertIn("rules[0].input: Input 'A9' is not an analog pin", self._errs(d))
         self.assertEqual(self._errs(d, pins=["A9", "D1"], analog_pins=["A9"]), [])
         # The device says the pin exists but is not ADC-capable.
-        self.assertIn("rules[0].input: Pin 'A9' is not analog capable on this board",
+        self.assertIn("rules[0].input: pin 'A9' is not analog capable on this board",
                       self._errs(d, pins=["A9", "D1"], analog_pins=[]))
 
     def test_too_many_analog_rules(self):
