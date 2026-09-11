@@ -190,7 +190,7 @@ wheels = [
 
 [[package]]
 name = "siminput-updater"
-version = "1.1.0"
+version = "1.2.0"
 source = { editable = "." }
 dependencies = [
     { name = "customtkinter" },
@@ -206,7 +206,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "customtkinter", specifier = ">=5.2.0" },
+    { name = "customtkinter", specifier = ">=5.2.0,<7" },
     { name = "evdev", marker = "sys_platform == 'linux'", specifier = ">=1.7" },
     { name = "pyinstaller", marker = "extra == 'dev'", specifier = ">=6.0" },
     { name = "pyserial", specifier = ">=3.5" },
