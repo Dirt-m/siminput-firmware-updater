@@ -15,14 +15,18 @@ Design notes (these are what keep the list fast — keep them true):
 
 from __future__ import annotations
 
+import json
 import tkinter as tk
 from typing import TYPE_CHECKING, Callable
 
 import customtkinter as ctk
 
 from .. import ui_theme as t
-from ..config_model import RULE_TYPE_LABELS, Rule, _pin_sort_key
+from ..config_model import (
+    ANALOG_MAX, ANALOG_RULE_TYPES, RULE_TYPE_LABELS, Rule, _pin_sort_key, analog_pins_for_board,
+)
 from ..rule_list import RuleList
+from .calibrate_dialog import CalibrateDialog
 
 if TYPE_CHECKING:
     from ..pages.configure_page import ConfigurePage
@@ -33,10 +37,42 @@ DUPLICATE_GLYPH = "❐"
 DELETE_GLYPH = "✕"
 LEARN_GLYPH = "◉"
 LEARN_TIMEOUT_MS = 20000
+ANALOG_LEARN_DELTA = 3000   # raw counts a sensor must move to be "the one"
+THRESHOLD_MODES = ("above", "below")
 SYNC_BUILD_COUNT = 12   # cards built before the first paint on a config load
 BUILD_CHUNK = 6         # cards per idle callback after that
 AUTOSCROLL_MARGIN = 28  # px from the viewport edge that starts auto-scroll
 UNDO_WINDOW_MS = 10000  # how long "Undo" stays offered after a delete
+
+
+def _opt_int(text: str):
+    """'' → None (unset); an int when it parses; otherwise the raw text, so
+    the validator reports it instead of it silently becoming a default."""
+    text = text.strip()
+    if not text:
+        return None
+    try:
+        return int(text)
+    except ValueError:
+        return text
+
+
+def _parse_curve(text: str):
+    text = text.strip()
+    if not text:
+        return None
+    try:
+        return int(text)
+    except ValueError:
+        pass
+    try:
+        return float(text)
+    except ValueError:
+        pass
+    try:
+        return json.loads(text)
+    except ValueError:
+        return text
 
 
 def _entry(master, bg: str, width=78):
@@ -173,8 +209,7 @@ class RuleCard(tk.Frame):
                                     fg=self._muted, font=self._cap_font)
             self.summary.grid(row=0, column=1, sticky="w")
         else:
-            self.type_picker = Picker(self.body, [RULE_TYPE_LABELS[k] for k in RULE_TYPES],
-                                      self._on_type_change)
+            self.type_picker = Picker(self.body, editor.type_choices(rule.type), self._on_type_change)
             self.type_picker.set(RULE_TYPE_LABELS.get(rule.type, RULE_TYPE_LABELS["MAP"]))
             self.type_picker.grid(row=0, column=0, padx=(0, 14), sticky="nw")
             self._plain.append(self.type_picker)
@@ -252,6 +287,36 @@ class RuleCard(tk.Frame):
             self._field(r, "Input", lambda p: self._pin(p, "input", self.rule.input), learn="input")
             self._field(r, "Axis", lambda p: self._axis(p))
             self._field(r, "Step", lambda p: self._num(p, "step", self.rule.step))
+        elif tp == "ANALOG":
+            r = self._row()
+            self._field(r, "Pin", lambda p: self._analog_pin(p, self.editor.analog_pins()), learn="analog")
+            self._arrow(r)
+            self._field(r, "Axis", lambda p: self._axis(p))
+            self._invert(r)
+            self._button(r, "Calibrate…", self._calibrate)
+            r2 = self._row()
+            self._field(r2, "Min", lambda p: self._opt(p, "min", self.rule.min, "0"))
+            self._field(r2, "Max", lambda p: self._opt(p, "max", self.rule.max, "65535"))
+            self._field(r2, "Center", lambda p: self._opt(p, "center", self.rule.center, "none"))
+            self._field(r2, "Deadzone", lambda p: self._opt(p, "deadzone", self.rule.deadzone, "0"))
+            r3 = self._row()
+            self._field(r3, "Filter (0-8)", lambda p: self._opt(p, "filter", self.rule.filter, "2"))
+            self._field(r3, "Hysteresis", lambda p: self._opt(p, "hysteresis", self.rule.hysteresis, "0"))
+            self._field(r3, "Curve", lambda p: self._curve(p))
+            self._summary()
+        elif tp == "THRESHOLD":
+            r = self._row()
+            self._field(r, "Input", lambda p: self._analog_pin(
+                p, self.editor.analog_pins() + self.editor.axis_choices()), learn="analog")
+            self._arrow(r)
+            self._field(r, "Output", lambda p: self._pin(p, "output", self.rule.output))
+            self._invert(r)
+            r2 = self._row()
+            self._field(r2, "When", lambda p: self._mode(p))
+            self._field(r2, "Value", lambda p: self._opt(
+                p, "threshold", self.rule.below if self.rule.above is None else self.rule.above, ""))
+            self._field(r2, "Hysteresis", lambda p: self._opt(p, "hysteresis", self.rule.hysteresis, "0"))
+            self._summary()
         self._sync_summary()
         self._apply_errors()
 
@@ -316,6 +381,50 @@ class RuleCard(tk.Frame):
         self._widgets[key] = e
         return e
 
+    def _opt(self, parent, key, current, placeholder: str):
+        """An optional integer: blank means "use the firmware default"."""
+        e = _entry(parent, self._bg, width=70)
+        e.configure(placeholder_text=placeholder)
+        if current is not None:
+            e.insert(0, str(current))
+        self._bind_entry(e)
+        self._widgets[key] = e
+        return e
+
+    def _curve(self, parent):
+        e = _entry(parent, self._bg, width=150)
+        e.configure(placeholder_text="1 or [[in,out],…]")
+        cur = self.rule.curve
+        if cur is not None:
+            e.insert(0, json.dumps(cur) if isinstance(cur, list) else str(cur))
+        self._bind_entry(e)
+        self._widgets["curve"] = e
+        return e
+
+    def _analog_pin(self, parent, choices: list[str]):
+        current = self.rule.input
+        choices = list(dict.fromkeys(choices)) or [""]
+        if current and current not in choices:
+            choices = [current, *choices]
+        picker = Picker(parent, choices, lambda _v: self._sync(), width_chars=9)
+        picker.set(current or choices[0])
+        self._widgets["input"] = picker
+        self._plain.append(picker)
+        return picker
+
+    def _mode(self, parent):
+        picker = Picker(parent, list(THRESHOLD_MODES), lambda _v: self._sync(), width_chars=7)
+        picker.set("below" if self.rule.above is None and self.rule.below is not None else "above")
+        self._widgets["mode"] = picker
+        self._plain.append(picker)
+        return picker
+
+    def _button(self, row, text: str, command):
+        b = Glyph(row, text, command, t.ACCENT, t.HOVER, self._bg, size=12)
+        b.pack(side="left", padx=(18, 0))
+        self._glyphs.append(b)
+        return b
+
     def _axis(self, parent):
         choices = self.editor.axis_choices() or [""]
         current = self.rule.axis
@@ -329,13 +438,20 @@ class RuleCard(tk.Frame):
 
     def refresh_axis_choices(self):
         picker = self._widgets.get("axis")
-        if picker is None:
-            return
-        choices = self.editor.axis_choices() or [""]
-        current = picker.get()
-        if current and current not in choices:
-            choices = [current, *choices]
-        picker.configure_values(choices)
+        if picker is not None:
+            choices = self.editor.axis_choices() or [""]
+            current = picker.get()
+            if current and current not in choices:
+                choices = [current, *choices]
+            picker.configure_values(choices)
+        # A THRESHOLD input may be an axis id too.
+        inp = self._widgets.get("input")
+        if self.rule.type == "THRESHOLD" and isinstance(inp, Picker):
+            choices = self.editor.analog_pins() + self.editor.axis_choices()
+            current = inp.get()
+            if current and current not in choices:
+                choices = [current, *choices]
+            inp.configure_values(choices or [""])
 
     def _invert(self, row):
         cb = ctk.CTkCheckBox(
@@ -392,6 +508,8 @@ class RuleCard(tk.Frame):
         self.rule.pulse_ms = 100 if self.rule.type == "PULSE" else 0
         self._build_fields()
         self._sync()
+        # A type change can add rows; keep the whole card in view.
+        self.editor._scroll_to(self)
 
     def _sync(self):
         self._apply_edits()
@@ -431,6 +549,19 @@ class RuleCard(tk.Frame):
                     setattr(self.rule, key, int(w[key].get()))
                 except (ValueError, AttributeError):
                     pass
+        # Optional analog fields: blank means unset (firmware default); a
+        # non-number is kept as text so validation can point at it.
+        for key in ("min", "max", "center", "deadzone", "filter", "hysteresis"):
+            if key in w:
+                setattr(self.rule, key, _opt_int(w[key].get()))
+        if "curve" in w:
+            self.rule.curve = _parse_curve(w["curve"].get())
+        if "mode" in w and "threshold" in w:
+            value = _opt_int(w["threshold"].get())
+            if w["mode"].get() == "below":
+                self.rule.above, self.rule.below = None, value
+            else:
+                self.rule.above, self.rule.below = value, None
 
     # ---------------------------------------------------------- validation
 
@@ -452,6 +583,8 @@ class RuleCard(tk.Frame):
             return w.get("inputs")
         if field == "type":
             return self.type_picker
+        if field in ("above", "below"):
+            return w.get("threshold")
         return w.get(field)
 
     def _apply_errors(self):
@@ -492,6 +625,12 @@ class RuleCard(tk.Frame):
         w = self._widgets.get(key)
         if w is None:
             return
+        if isinstance(w, Picker):
+            if pin not in w._values:
+                w.configure_values([pin, *w._values])
+            w.set(pin)
+            self._sync()
+            return
         if key == "inputs":
             current = [s.strip() for s in w.get().split(",") if s.strip()]
             if pin not in current:
@@ -526,6 +665,28 @@ class RuleCard(tk.Frame):
                 except Exception:
                     pass
                 return
+
+    def _calibrate(self):
+        self._apply_edits()
+        pin = self.rule.input
+        if not pin:
+            self.editor.page.app.show_status("Pick the analog pin first", "info")
+            return
+        if not self.editor.page.app.device.connected:
+            self.editor.page.app.show_status("Connect a device to calibrate against it", "info")
+            return
+        current = {"center": self.rule.center, "deadzone": self.rule.deadzone}
+        self.calibrate_dialog = CalibrateDialog(self, self.editor.page.app, pin, current, self._apply_calibration)
+
+    def _apply_calibration(self, values: dict):
+        for key in ("min", "max", "center", "deadzone"):
+            e = self._widgets.get(key)
+            if e is None:
+                continue
+            e.delete(0, "end")
+            if values.get(key) is not None:
+                e.insert(0, str(values[key]))
+        self._sync()
 
     # ------------------------------------------------------------ actions
 
@@ -624,6 +785,7 @@ class RuleEditor(ctk.CTkFrame):
         self._hint = ctk.CTkLabel(bar, text="", font=t.font(12), text_color=t.ACCENT, anchor="w")
         self._hint.grid(row=0, column=3, sticky="w", padx=(12, 4))
         self._learn: tuple[RuleCard, str] | None = None
+        self._learn_baseline: dict[str, int] | None = None
         self._learn_after: str | None = None
         self._hint_after: str | None = None
         self.winfo_toplevel().bind("<Escape>", lambda _e: self.cancel_learn(), add="+")
@@ -671,6 +833,35 @@ class RuleEditor(ctk.CTkFrame):
             return self.page.app.device_pins
         except Exception:
             return None
+
+    def analog_pins(self) -> list[str]:
+        """ADC pins to offer: the device's list when it reports one, else the
+        per-board table."""
+        try:
+            pins = self.page.app.analog_pins
+            if pins is None:
+                pins = analog_pins_for_board(self.page.app.board_map)
+        except Exception:
+            pins = analog_pins_for_board("")
+        return sorted(pins, key=_pin_sort_key)
+
+    def analog_supported(self) -> bool:
+        try:
+            return bool(self.page.app.analog_supported)
+        except Exception:
+            return True
+
+    def type_choices(self, current: str = "") -> list[str]:
+        """Rule types to offer. Analog types are hidden on firmware without
+        the capability, except for a rule that already is one."""
+        keys = [k for k in RULE_TYPES
+                if k not in ANALOG_RULE_TYPES or self.analog_supported() or k == current]
+        return [RULE_TYPE_LABELS[k] for k in keys]
+
+    def refresh_type_menus(self):
+        for card in self._cards:
+            if card.type_picker is not None:
+                card.type_picker.configure_values(self.type_choices(card.rule.type))
 
     def load_rules(self, rules: list[Rule]):
         """Replace the whole list. The first screenful is built before this
@@ -822,8 +1013,12 @@ class RuleEditor(ctk.CTkFrame):
             return
         self.cancel_learn()
         self._learn = (card, key)
+        self._learn_baseline = None
         card.set_learning(key)
-        self._show_hint("Press a switch on the box…  (Esc to cancel)", None)
+        if key == "analog":
+            self._show_hint("Move the sensor on the box…  (Esc to cancel)", None)
+        else:
+            self._show_hint("Press a switch on the box…  (Esc to cancel)", None)
         self._learn_after = self.after(LEARN_TIMEOUT_MS, self._learn_timeout)
 
     def cancel_learn(self):
@@ -840,20 +1035,42 @@ class RuleEditor(ctk.CTkFrame):
 
     def _learn_timeout(self):
         self._learn_after = None
+        was_analog = self._learn is not None and self._learn[1] == "analog"
         self.cancel_learn()
-        self._show_hint("No pin changed. Pins used by an encoder can't be learned.", 6000)
+        if was_analog:
+            self._show_hint("No sensor moved. The box only samples pins the saved config claims as analog.", 8000)
+        else:
+            self._show_hint("No pin changed. Pins used by an encoder can't be learned.", 6000)
 
     def on_live_state(self, state: dict):
         """Monitor callback (UI thread). Completes a pending Learn on the
         first pin that transitions to pressed; snapshot frames carry no
-        `changed` entries, so a fresh stream never triggers it."""
+        `changed` entries, so a fresh stream never triggers it. An analog
+        Learn picks the sampled pin that moved furthest from where it was
+        when Learn started."""
         if self._learn is None:
+            return
+        card, key = self._learn
+        if key == "analog":
+            samples = state.get("an") or {}
+            if not samples:
+                return
+            if self._learn_baseline is None:
+                self._learn_baseline = dict(samples)
+                return
+            moved = {p: abs(v - self._learn_baseline.get(p, v)) for p, v in samples.items()}
+            pin, delta = max(moved.items(), key=lambda kv: kv[1])
+            if delta < ANALOG_LEARN_DELTA:
+                return
+            self.cancel_learn()
+            if card.winfo_exists():
+                card.apply_learned("input", pin)
+                self._show_hint(f"Learned {pin}", 2500)
             return
         pins = state.get("p") or {}
         pressed = sorted((p for p in (state.get("changed") or ()) if pins.get(p)), key=_pin_sort_key)
         if not pressed:
             return
-        card, key = self._learn
         self.cancel_learn()
         if card.winfo_exists():
             card.apply_learned(key, pressed[0])

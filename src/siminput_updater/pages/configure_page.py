@@ -63,6 +63,9 @@ RULE_FIELD_LABELS = {
     "input": "Input", "inputs": "Inputs", "output": "Output", "cw": "CW", "ccw": "CCW",
     "axis": "Axis", "pulse_ms": "Pulse", "delay_ms": "Delay", "step": "Step",
     "divisor": "Steps/detent", "type": "Type",
+    "min": "Min", "max": "Max", "center": "Center", "deadzone": "Deadzone",
+    "filter": "Filter", "hysteresis": "Hysteresis", "curve": "Curve",
+    "above": "Threshold", "below": "Threshold",
 }
 
 
@@ -290,7 +293,8 @@ class ConfigurePage(ctk.CTkFrame):
         errors = [ValidationError(path, msg) for path, msg in self._input_errors()]
         if not errors:
             config = self._collect_config()
-            errors = validate(config, board_map=self.app.board_map, pins=self.app.device_pins)
+            errors = validate(config, board_map=self.app.board_map, pins=self.app.device_pins,
+                              analog_pins=self.app.analog_pins)
 
         rule_errors: dict[int, dict[str, str]] = {}
         bad_vars: set[int] = set()
@@ -690,6 +694,9 @@ class ConfigurePage(ctk.CTkFrame):
     def _on_connection(self, connected: bool):
         self._refresh_connection_state()
         self.live_panel.set_connected(connected)
+        # The connected firmware decides whether analog rule types are offered.
+        self.rule_editor.refresh_type_menus()
+        self._schedule_validate()
         if not connected:
             self.rule_editor.cancel_learn()
 

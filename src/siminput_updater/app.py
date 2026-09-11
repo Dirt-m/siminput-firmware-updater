@@ -361,6 +361,24 @@ class App(ctk.CTk):
             return flat or None
         return None
 
+    @property
+    def analog_pins(self) -> list[str] | None:
+        """ADC-capable pins as reported by firmware 2.7+, else None (the
+        per-board table in config_model applies)."""
+        full = self.full_info
+        pins = getattr(full, "analog_pins", None) if full else None
+        return list(pins) if isinstance(pins, list) else None
+
+    @property
+    def analog_supported(self) -> bool:
+        """Whether analog rules may be offered. Unknown (no device) counts as
+        yes so a config can be edited offline; a connected device without the
+        capability hides the analog rule types and blocks saving them."""
+        full = self.full_info
+        if not self.device.connected or full is None:
+            return True
+        return "analog" in (getattr(full, "caps", None) or ())
+
     # ------------------------------------------------------- background scan
 
     def _scan_tick(self):
