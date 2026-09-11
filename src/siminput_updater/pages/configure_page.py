@@ -387,7 +387,8 @@ class ConfigurePage(ctk.CTkFrame):
         tab.grid_rowconfigure(1, weight=1)
 
         ctk.CTkLabel(
-            tab, text="Rules run top to bottom. A rule can read the output of any rule above it.",
+            tab, text="Rules run top to bottom. A rule can read the output of any rule above it. "
+                      "Drag ⠿ to reorder, right-click a rule for more.",
             font=t.font(12), text_color=t.TEXT_MUTED, anchor="w",
         ).grid(row=0, column=0, padx=10, pady=(10, 4), sticky="w")
 
