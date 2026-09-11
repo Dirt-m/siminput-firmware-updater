@@ -9,7 +9,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
-from siminput_updater.device import Device, DeviceLike  # noqa: E402
+from siminput_updater.device import Device, DeviceLike, describe_fault  # noqa: E402
 from siminput_updater.mock_device import MockDevice  # noqa: E402
 
 PROTOCOL_METHODS = [
@@ -189,6 +189,27 @@ class MockAnalogSemantics(unittest.TestCase):
             self.assertNotIn("an", self._collect(1)[0])
         finally:
             dev.disconnect()
+
+
+class FaultWording(unittest.TestCase):
+    """get_info.fault → what the Device page shows."""
+
+    def test_no_fault_renders_nothing(self):
+        self.assertEqual(describe_fault(""), "")
+
+    def test_analog_init_names_the_pin(self):
+        text = describe_fault("analog_init:A2")
+        self.assertTrue(text.startswith("A2 could not be opened as an analog input"), text)
+        self.assertIn("check the config and the pin", text)
+
+    def test_no_expander_and_unknown_faults(self):
+        self.assertIn("expander", describe_fault("no_expander"))
+        self.assertEqual(describe_fault("mystery"), "Device fault: mystery")
+
+    def test_mock_reports_a_fault_through_get_info(self):
+        dev = MockDevice()
+        dev.fault = "analog_init:A6"
+        self.assertEqual(dev.get_info().fault, "analog_init:A6")
 
 
 if __name__ == "__main__":

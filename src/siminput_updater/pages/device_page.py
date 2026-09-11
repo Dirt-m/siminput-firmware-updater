@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING
 import customtkinter as ctk
 
 from .. import ui_theme as t
+from ..device import describe_fault
 from ..widgets.analog_bar import AnalogBar
 from ..widgets.button_grid import ButtonGrid
 from ..widgets.axis_bar import AxisBar
@@ -92,6 +93,17 @@ class DevicePage(ctk.CTkFrame):
             val.grid(row=1, column=0, padx=12, pady=(0, 10), sticky="w")
             self._stat_labels[key] = val
         self._stats_row.grid_remove()
+
+        # A boot-time hardware fault the firmware reports (no_expander,
+        # analog_init:<pin>): shown under the chips for as long as it stands.
+        self._fault_row = ctk.CTkFrame(panel, fg_color=t.ERROR_SOFT, corner_radius=t.RADIUS,
+                                       border_width=1, border_color=t.ERROR)
+        self._fault_row.grid(row=1, column=0, sticky="ew", padx=18, pady=(0, 16))
+        self._fault_row.grid_columnconfigure(0, weight=1)
+        self._fault_label = ctk.CTkLabel(self._fault_row, text="", font=t.font(12), text_color=t.ERROR,
+                                         anchor="w", justify="left", wraplength=900)
+        self._fault_label.grid(row=0, column=0, padx=12, pady=8, sticky="w")
+        self._fault_row.grid_remove()
 
     # -------------------------------------------------------------- monitor
 
@@ -211,6 +223,7 @@ class DevicePage(ctk.CTkFrame):
                 self._analog_wrap.grid_remove()
         else:
             self._stats_row.grid_remove()
+            self._show_fault("")
             self._info_empty.grid()
             self._mon.grid_remove()
             self._empty.grid()
@@ -229,6 +242,14 @@ class DevicePage(ctk.CTkFrame):
             # Don't let a previous device's values masquerade as this one's.
             self._stat_labels["cp"].configure(text="—")
             self._stat_labels["nvm"].configure(text="—")
+        self._show_fault(describe_fault(getattr(full, "fault", "") or "") if full else "")
+
+    def _show_fault(self, text: str):
+        if text:
+            self._fault_label.configure(text=text)
+            self._fault_row.grid()
+        else:
+            self._fault_row.grid_remove()
 
     # --------------------------------------------------------------- stream
 

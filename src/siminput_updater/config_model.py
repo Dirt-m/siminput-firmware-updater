@@ -48,6 +48,12 @@ def analog_pins_for_board(board_map: str) -> list[str]:
 
 ANALOG_RULE_TYPES = ("ANALOG", "THRESHOLD")
 ANALOG_MAX = 65535
+# Firmware defaults for blank optional fields (never written into the config).
+ANALOG_HYSTERESIS_DEFAULT = 64
+THRESHOLD_HYSTERESIS_DEFAULT = 256
+# Each ANALOG rule costs a pipeline evaluation every 5 ms cycle on the box.
+MAX_ANALOG_RULES = 16
+MAX_THRESHOLD_RULES = 32
 
 AXIS_SLOT_LABELS = {
     1: "X", 2: "Y", 3: "Z",
@@ -567,6 +573,13 @@ def validate(config: Config, board_map: str = "",
     for r in config.rules:
         if r.is_analog and r.input in reserved:
             analog_used.add(r.input)
+
+    n_analog = sum(1 for r in config.rules if not r.comment and r.type == "ANALOG")
+    if n_analog > MAX_ANALOG_RULES:
+        errors.append(ValidationError("rules", f"too many ANALOG rules (max {MAX_ANALOG_RULES})"))
+    n_thresh = sum(1 for r in config.rules if not r.comment and r.type == "THRESHOLD")
+    if n_thresh > MAX_THRESHOLD_RULES:
+        errors.append(ValidationError("rules", f"too many THRESHOLD rules (max {MAX_THRESHOLD_RULES})"))
 
     # Axes driven by an ANALOG rule are overwritten every cycle: no store, no
     # AXIS_INC/DEC, and only one ANALOG rule per axis.

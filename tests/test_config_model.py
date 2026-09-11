@@ -234,6 +234,20 @@ class AnalogRules(unittest.TestCase):
         self.assertIn("rules[0].input: Pin 'A9' is not analog capable on this board",
                       self._errs(d, pins=["A9", "D1"], analog_pins=[]))
 
+    def test_too_many_analog_rules(self):
+        axes = [{"id": f"AX{i}", "output": "BACKLIGHT"} for i in range(17)]
+        rules = [{"type": "ANALOG", "input": "A1", "axis": f"AX{i}"} for i in range(17)]
+        errs = self._errs(_analog_cfg(rules=rules, axes=axes))
+        self.assertIn("rules: too many ANALOG rules (max 16)", errs)
+        self.assertNotIn("rules: too many ANALOG rules (max 16)",
+                         self._errs(_analog_cfg(rules=rules[:16], axes=axes)))
+
+    def test_too_many_threshold_rules(self):
+        rules = [{"type": "THRESHOLD", "input": "A1", "output": f"B{i + 1}", "above": 100} for i in range(33)]
+        errs = self._errs(_analog_cfg(rules=rules))
+        self.assertIn("rules: too many THRESHOLD rules (max 32)", errs)
+        self.assertEqual([e for e in self._errs(_analog_cfg(rules=rules[:32])) if "too many" in e], [])
+
     def test_digital_only_config_unchanged(self):
         src = {"rules": [{"type": "MAP", "input": "D1", "output": "B1"},
                          {"type": "ENCODER", "inputs": ["D2", "D3"], "cw": "B2", "ccw": "B3"}]}

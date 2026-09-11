@@ -7,7 +7,9 @@ import threading
 import time
 from typing import Callable
 
-from .config_model import ANALOG_MAX, Config, analog_pins_for_board, pins_for_board, validate
+from .config_model import (
+    ANALOG_MAX, THRESHOLD_HYSTERESIS_DEFAULT, Config, analog_pins_for_board, pins_for_board, validate,
+)
 from .device import DeviceError, DeviceInfo, FullDeviceInfo
 
 MOCK_BOARD_MAP = "rev1"
@@ -40,6 +42,7 @@ class MockDevice:
     def __init__(self, config: dict | None = None):
         self._config = config or copy.deepcopy(MOCK_CONFIG)
         self._version = MOCK_VERSION
+        self.fault = ""   # e.g. "no_expander" or "analog_init:A6", like box.fault
         self._streaming = False
         self._stream_thread: threading.Thread | None = None
         self._stream_callback: Callable[[dict], None] | None = None
@@ -128,7 +131,7 @@ class MockDevice:
                 value = self._axes[self._axis_slots[r.input] - 1]
             else:
                 continue
-            hyst = r.hysteresis or 0
+            hyst = THRESHOLD_HYSTERESIS_DEFAULT if r.hysteresis is None else r.hysteresis
             prev = self._threshold_state.get(i, False)
             if r.above is not None:
                 on = value > r.above - hyst if prev else value >= r.above
@@ -231,6 +234,7 @@ class MockDevice:
             limits={"max_line": 4096, "chunk": 2048, "max_config": 32768},
             analog_pins=sorted(analog_pins_for_board(MOCK_BOARD_MAP)),
             analog_active=sorted(self._analog),
+            fault=self.fault,
         )
 
     def get_config(self) -> dict:
