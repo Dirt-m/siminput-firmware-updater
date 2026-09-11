@@ -12,6 +12,7 @@ Plain-tk widgets (Canvas) can't take tuples — pass colours through resolve().
 from __future__ import annotations
 
 import sys
+import tkinter.font as tkfont
 
 import customtkinter as ctk
 
@@ -126,3 +127,45 @@ def danger_button(master, text: str, command=None, **kw) -> ctk.CTkButton:
     )
     opts.update(kw)
     return ctk.CTkButton(master, **opts)
+
+
+# --- plain-tk helpers -------------------------------------------------------
+# customtkinter widgets are expensive (each is a canvas plus a draw engine), so
+# high-count views such as the rule list draw their static chrome with plain
+# tk widgets. Those need resolved colours and pre-scaled fonts.
+
+_tk_font_cache: dict[tuple, tkfont.Font] = {}
+
+
+def widget_scaling(widget) -> float:
+    try:
+        from customtkinter.windows.widgets.scaling.scaling_tracker import ScalingTracker
+        return float(ScalingTracker.get_widget_scaling(widget))
+    except Exception:
+        return 1.0
+
+
+def tk_font(widget, size: int = 13, weight: str = "normal", mono: bool = False) -> tkfont.Font:
+    """A tkinter Font sized like the CTk fonts at the widget's scaling.
+
+    customtkinter sizes its fonts in *pixels* (a negative Tk size) after
+    multiplying by the widget scaling. A positive size would be in points,
+    which Tk scales by the screen DPI on its own — on a HiDPI display that
+    doubled the scaling and drew the rule cards at twice the size of every
+    CTk widget around them.
+    """
+    family = MONO_FAMILY if mono else ""
+    pixels = max(1, round(size * widget_scaling(widget)))
+    key = (family, pixels, weight)
+    f = _tk_font_cache.get(key)
+    if f is None:
+        kw = dict(size=-pixels, weight=weight)
+        if family:
+            kw["family"] = family
+        f = _tk_font_cache[key] = tkfont.Font(**kw)
+    return f
+
+
+def px(widget, n: int) -> int:
+    """Scale a logical pixel measure like customtkinter does for its widgets."""
+    return max(0, round(n * widget_scaling(widget)))
