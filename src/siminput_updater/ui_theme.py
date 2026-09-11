@@ -146,13 +146,20 @@ def widget_scaling(widget) -> float:
 
 
 def tk_font(widget, size: int = 13, weight: str = "normal", mono: bool = False) -> tkfont.Font:
-    """A tkinter Font sized like the CTk fonts at the widget's scaling."""
+    """A tkinter Font sized like the CTk fonts at the widget's scaling.
+
+    customtkinter sizes its fonts in *pixels* (a negative Tk size) after
+    multiplying by the widget scaling. A positive size would be in points,
+    which Tk scales by the screen DPI on its own — on a HiDPI display that
+    doubled the scaling and drew the rule cards at twice the size of every
+    CTk widget around them.
+    """
     family = MONO_FAMILY if mono else ""
-    scaled = max(1, round(size * widget_scaling(widget)))
-    key = (family, scaled, weight)
+    pixels = max(1, round(size * widget_scaling(widget)))
+    key = (family, pixels, weight)
     f = _tk_font_cache.get(key)
     if f is None:
-        kw = dict(size=scaled, weight=weight)
+        kw = dict(size=-pixels, weight=weight)
         if family:
             kw["family"] = family
         f = _tk_font_cache[key] = tkfont.Font(**kw)

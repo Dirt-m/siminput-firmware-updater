@@ -218,14 +218,14 @@ class RuleCard(tk.Frame):
             r2 = self._row()
             self._field(r2, "Pulse (ms)", lambda p: self._num(p, "pulse_ms", self.rule.pulse_ms))
             self._field(r2, "Delay (ms)", lambda p: self._num(p, "delay_ms", self.rule.delay_ms))
-            self._summary(r2)
+            self._summary()
         elif tp == "NOR":
             r = self._row()
             self._field(r, "Inputs (any of)", lambda p: self._list(p, "inputs", self.rule.inputs))
             self._arrow(r)
             self._field(r, "Output", lambda p: self._pin(p, "output", self.rule.output))
             self._invert(r)
-            self._summary(self._row())
+            self._summary()
         elif tp == "ENCODER":
             pins = (list(self.rule.inputs) + ["", ""])[:2]
             r = self._row()
@@ -237,7 +237,7 @@ class RuleCard(tk.Frame):
             self._field(r2, "Pulse (ms)", lambda p: self._num(p, "pulse_ms", self.rule.pulse_ms))
             self._field(r2, "Steps/detent", lambda p: self._num(p, "divisor", self.rule.divisor))
             self._invert(r2)
-            self._summary(r2)
+            self._summary()
         elif tp in ("AXIS_INC", "AXIS_DEC"):
             r = self._row()
             self._field(r, "Input", lambda p: self._pin(p, "input", self.rule.input))
@@ -245,9 +245,9 @@ class RuleCard(tk.Frame):
             self._field(r, "Step", lambda p: self._num(p, "step", self.rule.step))
         self._sync_summary()
 
-    def _row(self) -> tk.Frame:
+    def _row(self, gap: int = 6) -> tk.Frame:
         row = tk.Frame(self.fields, bg=self._bg)
-        row.grid(row=len(self._rows), column=0, sticky="ew", pady=(0 if not self._rows else 6, 0))
+        row.grid(row=len(self._rows), column=0, sticky="ew", pady=(0 if not self._rows else gap, 0))
         self._rows.append(row)
         return row
 
@@ -260,9 +260,12 @@ class RuleCard(tk.Frame):
     def _arrow(self, row):
         self._caption(row, "→").pack(side="left", padx=(0, 18))
 
-    def _summary(self, row):
-        self.summary = tk.Label(row, anchor="e", bg=self._bg, fg=self._muted, font=self._cap_font)
-        self.summary.pack(side="right", padx=(12, 4))
+    def _summary(self):
+        """A one-line reading of the rule on its own row, for the types whose
+        fields alone don't tell the story (NOR, PULSE, ENCODER)."""
+        row = self._row(gap=3)
+        self.summary = tk.Label(row, anchor="w", bg=self._bg, fg=self._muted, font=self._cap_font)
+        self.summary.pack(side="left")
 
     def _bind_entry(self, e):
         e.bind("<KeyRelease>", lambda _e: self._sync())
