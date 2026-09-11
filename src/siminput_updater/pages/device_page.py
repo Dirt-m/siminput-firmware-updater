@@ -162,7 +162,7 @@ class DevicePage(ctk.CTkFrame):
         self._analog_empty = ctk.CTkLabel(
             self._analog_rows, text="No analog pins claimed. Add an Analog Axis or Analog "
                                     "Threshold rule and save.",
-            font=t.font(12), text_color=t.TEXT_MUTED, anchor="w")
+            font=t.font(12), text_color=t.TEXT_MUTED, anchor="w", justify="left", wraplength=230)
         self._analog_empty.grid(row=0, column=0, sticky="w")
         self._analog_bars: dict[str, AnalogBar] = {}
         self._analog_wrap.grid_remove()
