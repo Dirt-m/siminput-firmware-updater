@@ -7,11 +7,13 @@ import threading
 import time
 from typing import Callable
 
-from .config_model import Config, pins_for_board, validate
+from .config_model import ANALOG_MAX, Config, analog_pins_for_board, pins_for_board, validate
 from .device import DeviceError, DeviceInfo, FullDeviceInfo
 
 MOCK_BOARD_MAP = "rev1"
-MOCK_VERSION = "2.3.0-mock"
+MOCK_VERSION = "2.7.0-mock"
+ANALOG_STREAM_DELTA = 64   # serial_handler._ANALOG_STREAM_DELTA
+ANALOG_DRIFT = 500         # max raw counts a fake sensor moves per tick
 
 MOCK_CONFIG = {
     "device": {"name": "Mock SimInput Box", "pid": 61440, "debounce_ms": 10},
@@ -47,10 +49,18 @@ class MockDevice:
         self._axes: list[int] = [32767] * 8
         self._bools: dict[str, bool] = {}
         self._pins: dict[str, bool] = {}
+        # Raw 16-bit samples of the pins the config claims as analog, like
+        # the firmware's box.analog_raw; the fake sensors drift each tick.
+        self._analog: dict[str, int] = {}
+        self._analog_rules: list = []
+        self._threshold_rules: list = []
+        self._threshold_state: dict[int, bool] = {}
+        self._axis_slots: dict[str, int] = {}
         self._snapshot_pending = False
         self._stream_prev_btns: list[int] | None = None
         self._stream_prev_axes: list[int] | None = None
         self._stream_prev_pins: dict[str, bool] = {}
+        self._stream_prev_analog: dict[str, int] | None = None
         self._update_staging: dict[str, bytes] | None = None
         self._init_state()
 
@@ -58,10 +68,91 @@ class MockDevice:
         self._pins = {p: False for p in pins_for_board(MOCK_BOARD_MAP)}
         cfg = Config.from_dict(self._config)
         self._bools = {b.id: b.default for b in cfg.bools}
+        self._axis_slots = {}
         for a in cfg.axes:
             slot = a.output
             if isinstance(slot, int) and 1 <= slot <= 8:
                 self._axes[slot - 1] = a.default
+                self._axis_slots[a.id] = slot
+        adc = set(analog_pins_for_board(MOCK_BOARD_MAP))
+        self._analog_rules = [r for r in cfg.rules if not r.comment and r.type == "ANALOG"]
+        self._threshold_rules = [r for r in cfg.rules if not r.comment and r.type == "THRESHOLD"]
+        self._threshold_state = {}
+        claimed = {r.input for r in self._analog_rules + self._threshold_rules if r.input in adc}
+        # Keep a sensor's current reading across a config save; new pins
+        # start mid-scale like a pot at rest.
+        self._analog = {p: self._analog.get(p, ANALOG_MAX // 2) for p in sorted(claimed)}
+        self._apply_analog_rules()
+
+    # ---------------------------------------------------------- analog sim
+
+    def _analog_axes(self) -> set[int]:
+        return {self._axis_slots[r.axis] - 1 for r in self._analog_rules if r.axis in self._axis_slots}
+
+    def _apply_analog_rules(self):
+        """A simplified copy of the firmware pipeline (range, center and
+        deadzone, invert; no filter or curve): enough for the configurator
+        to show an axis following its sensor and a THRESHOLD lighting a
+        button."""
+        for r in self._analog_rules:
+            slot = self._axis_slots.get(r.axis)
+            if slot is None or r.input not in self._analog:
+                continue
+            raw = self._analog[r.input]
+            lo = 0 if r.min is None else r.min
+            hi = ANALOG_MAX if r.max is None else r.max
+            if hi <= lo:
+                continue
+            if r.center is None:
+                val = (max(lo, min(hi, raw)) - lo) * ANALOG_MAX // (hi - lo)
+            else:
+                dz = r.deadzone or 0
+                c_lo, c_hi = r.center - dz, r.center + dz
+                mid = ANALOG_MAX // 2
+                if raw <= c_lo:
+                    span = max(1, c_lo - lo)
+                    val = (max(lo, raw) - lo) * mid // span
+                elif raw >= c_hi:
+                    span = max(1, hi - c_hi)
+                    val = mid + (min(hi, raw) - c_hi) * (ANALOG_MAX - mid) // span
+                else:
+                    val = mid
+            if r.invert:
+                val = ANALOG_MAX - val
+            self._axes[slot - 1] = max(0, min(ANALOG_MAX, val))
+
+        for i, r in enumerate(self._threshold_rules):
+            if r.input in self._analog:
+                value = self._analog[r.input]
+            elif r.input in self._axis_slots:
+                value = self._axes[self._axis_slots[r.input] - 1]
+            else:
+                continue
+            hyst = r.hysteresis or 0
+            prev = self._threshold_state.get(i, False)
+            if r.above is not None:
+                on = value > r.above - hyst if prev else value >= r.above
+            elif r.below is not None:
+                on = value < r.below + hyst if prev else value <= r.below
+            else:
+                continue
+            self._threshold_state[i] = on
+            if r.invert:
+                on = not on
+            out = r.output
+            if out.startswith("B") and out[1:].isdigit():
+                if on:
+                    self._buttons.add(int(out[1:]))
+                else:
+                    self._buttons.discard(int(out[1:]))
+            elif out in self._bools:
+                self._bools[out] = on
+
+    def set_analog(self, pin: str, raw: int) -> None:
+        """Test hook: drive a fake sensor to an exact reading."""
+        if pin in self._analog:
+            self._analog[pin] = max(0, min(ANALOG_MAX, int(raw)))
+            self._apply_analog_rules()
 
     @property
     def connected(self) -> bool:
@@ -136,8 +227,10 @@ class MockDevice:
             rules_count=len(self._config.get("rules", [])),
             hash_algo="sha256",
             protocol=2,
-            caps=("staged_update", "hard_reboot", "stream", "chunked_config", "request_id"),
+            caps=("staged_update", "hard_reboot", "stream", "chunked_config", "request_id", "analog"),
             limits={"max_line": 4096, "chunk": 2048, "max_config": 32768},
+            analog_pins=sorted(analog_pins_for_board(MOCK_BOARD_MAP)),
+            analog_active=sorted(self._analog),
         )
 
     def get_config(self) -> dict:
@@ -164,6 +257,7 @@ class MockDevice:
             "axes": list(self._axes),
             "bools": dict(self._bools),
             "pins": dict(self._pins),
+            "analog": dict(self._analog),
         }
 
     @property
@@ -203,6 +297,7 @@ class MockDevice:
         self._stream_prev_btns = None
         self._stream_prev_axes = None
         self._stream_prev_pins = {}
+        self._stream_prev_analog = None
 
     def _stream_loop(self, interval_ms: int):
         while self._streaming:
@@ -224,7 +319,14 @@ class MockDevice:
         else:
             pins_changed = {k: v for k, v in self._pins.items()
                             if self._stream_prev_pins.get(k) != v}
-        if not snapshot and not pins_changed \
+        # "an" is re-sent as a whole once any sensor drifts past the noise
+        # floor since the last frame that carried it (or in the first frame).
+        analog = dict(self._analog)
+        prev_an = self._stream_prev_analog
+        analog_changed = bool(analog) and (
+            prev_an is None or any(abs(v - prev_an.get(k, -10 ** 6)) >= ANALOG_STREAM_DELTA
+                                   for k, v in analog.items()))
+        if not snapshot and not pins_changed and not analog_changed \
                 and btns == self._stream_prev_btns and axes == self._stream_prev_axes:
             return None
 
@@ -232,10 +334,14 @@ class MockDevice:
         self._stream_prev_btns = btns
         self._stream_prev_axes = axes
         self._stream_prev_pins.update(pins_changed)
+        if analog_changed:
+            self._stream_prev_analog = analog
 
         frame = {"src": "serial", "b": btns, "a": axes}
         if pins_changed:
             frame["p"] = pins_changed
+        if analog_changed:
+            frame["an"] = analog
         if snapshot:
             frame["snapshot"] = True
         return frame
@@ -252,8 +358,16 @@ class MockDevice:
                 self._buttons.add(btn)
         if random.random() < 0.08:
             idx = random.randint(0, 7)
-            delta = random.randint(-2048, 2048)
-            self._axes[idx] = max(0, min(65535, self._axes[idx] + delta))
+            if idx not in self._analog_axes():
+                delta = random.randint(-2048, 2048)
+                self._axes[idx] = max(0, min(65535, self._axes[idx] + delta))
+        if self._analog:
+            for pin in self._analog:
+                # A slow wander plus ADC-like jitter, so the calibration view
+                # has something to show even when nobody touches the box.
+                delta = random.randint(-ANALOG_DRIFT, ANALOG_DRIFT) + random.randint(-40, 40)
+                self._analog[pin] = max(0, min(ANALOG_MAX, self._analog[pin] + delta))
+            self._apply_analog_rules()
 
     def update_begin(self) -> None:
         # Matches firmware ≥2.5.0: stale staging from a dead session is

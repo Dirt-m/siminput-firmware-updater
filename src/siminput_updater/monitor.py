@@ -74,6 +74,11 @@ class StateMerger:
 
     Pins claimed by ENCODER rules are deinit'd by the firmware and read False
     forever; that is the device's behaviour, not a merge artefact.
+
+    Serial "an" (firmware 2.7+) carries the raw 16-bit sample of every claimed
+    analog pin, present only when one moved past the ADC noise floor or in
+    the first frame. Absent means unchanged, so it merges into the kept map
+    and values stay ints — a raw sample of 1 is not "pressed".
     """
 
     def __init__(self, evdev_active: bool = False):
@@ -81,6 +86,7 @@ class StateMerger:
         self.buttons: set[int] = set()
         self.axes: list[int] = [32767] * 8
         self.pins: dict[str, bool] = {}
+        self.analog: dict[str, int] = {}
 
     def feed(self, frame: dict) -> State:
         src = frame.get("src", "serial")
@@ -105,6 +111,13 @@ class StateMerger:
                     changed.add(name)
                 self.pins[name] = val
 
+        analog = frame.get("an")
+        if not from_evdev and isinstance(analog, dict):
+            for name, raw in analog.items():
+                if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+                    continue
+                self.analog[str(name)] = int(raw)
+
         return self.state(changed=changed, snapshot=snapshot)
 
     def state(self, changed: set[str] | None = None, snapshot: bool = False) -> State:
@@ -112,6 +125,7 @@ class StateMerger:
             "b": set(self.buttons),
             "a": list(self.axes),
             "p": dict(self.pins),
+            "an": dict(self.analog),
             "changed": set(changed or ()),
             "snapshot": snapshot,
         }

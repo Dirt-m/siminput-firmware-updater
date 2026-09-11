@@ -14,7 +14,7 @@ from siminput_updater.monitor import (  # noqa: E402
 )
 
 
-def serial(b=None, a=None, p=None, snapshot=False):
+def serial(b=None, a=None, p=None, an=None, snapshot=False):
     frame = {"src": "serial"}
     if b is not None:
         frame["b"] = b
@@ -22,6 +22,8 @@ def serial(b=None, a=None, p=None, snapshot=False):
         frame["a"] = a
     if p is not None:
         frame["p"] = p
+    if an is not None:
+        frame["an"] = an
     if snapshot:
         frame["snapshot"] = True
     return frame
@@ -111,6 +113,38 @@ class PinDeltasAndSnapshots(unittest.TestCase):
         state["b"].add(9)
         self.assertEqual(self.m.pins, {"D1": True})
         self.assertEqual(self.m.buttons, {1})
+
+
+class AnalogSamples(unittest.TestCase):
+    """Firmware 2.7 "an": raw ADC samples, ints, merged not replaced."""
+
+    def setUp(self):
+        self.m = StateMerger(evdev_active=True)
+
+    def test_samples_stay_ints(self):
+        state = self.m.feed(serial(an={"A1": 1, "A2": 0}, snapshot=True))
+        self.assertEqual(state["an"], {"A1": 1, "A2": 0})
+        self.assertIs(type(state["an"]["A1"]), int)
+        self.assertIsNot(state["an"]["A1"], True)
+
+    def test_partial_frames_merge(self):
+        self.m.feed(serial(an={"A1": 100, "A2": 200}, snapshot=True))
+        state = self.m.feed(serial(an={"A1": 150}))
+        self.assertEqual(state["an"], {"A1": 150, "A2": 200})
+
+    def test_frames_without_an_keep_the_last_samples(self):
+        self.m.feed(serial(an={"A1": 100}, snapshot=True))
+        self.assertEqual(self.m.feed(serial(p={"D1": True}))["an"], {"A1": 100})
+        self.assertEqual(self.m.feed(evdev(b=[1]))["an"], {"A1": 100})
+
+    def test_garbage_values_are_ignored(self):
+        state = self.m.feed(serial(an={"A1": True, "A2": "x", "A3": 7.0}))
+        self.assertEqual(state["an"], {"A3": 7})
+
+    def test_state_copies_the_map(self):
+        state = self.m.feed(serial(an={"A1": 5}))
+        state["an"]["A1"] = 9
+        self.assertEqual(self.m.analog["A1"], 5)
 
 
 class Watchdog(unittest.TestCase):
