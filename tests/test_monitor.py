@@ -10,7 +10,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 from siminput_updater.monitor import (  # noqa: E402
-    REARM_GAP_S, SILENCE_S, StateMerger, should_rearm,
+    REARM_GAP_S, SILENCE_S, LiveMonitor, StateMerger, should_rearm,
 )
 
 
@@ -162,6 +162,66 @@ class Watchdog(unittest.TestCase):
                                       last_rearm=now - REARM_GAP_S / 2))
         self.assertTrue(should_rearm(now, last_frame=0.0,
                                      last_rearm=now - REARM_GAP_S))
+
+
+class _InstantDevice:
+    """A device whose stream delivers its snapshot frame before start_stream
+    even returns — the mock does exactly this, and hardware can be close."""
+    connected = True
+    stream_uses_evdev = False
+
+    def __init__(self):
+        self.started = 0
+
+    def start_stream(self, callback, interval_ms=50, on_end=None):
+        self.started += 1
+        callback({"src": "serial", "b": [], "a": [32767] * 8, "p": {"D1": True},
+                  "an": {"A1": 1234}, "snapshot": True})
+
+    def stop_stream(self):
+        pass
+
+    def rearm_stream(self):
+        pass
+
+
+class _FakeApp:
+    """Just enough of App for LiveMonitor: listeners, a synchronous post,
+    and after() that never fires."""
+
+    def __init__(self, device):
+        self.device = device
+        self._closing = False
+        self.listeners = []
+
+    def register_connection_listener(self, fn):
+        self.listeners.append(fn)
+
+    def post(self, fn):
+        fn()
+
+    def after(self, _ms, _fn):
+        return "never"
+
+    def after_cancel(self, _id):
+        pass
+
+    def show_status(self, *a, **k):
+        pass
+
+
+class StartKeepsTheFirstFrame(unittest.TestCase):
+    def test_snapshot_delivered_during_start_is_not_lost(self):
+        device = _InstantDevice()
+        app = _FakeApp(device)
+        mon = LiveMonitor(app)
+        seen = []
+        mon.subscribe(seen.append)
+        mon.acquire()
+        self.assertEqual(device.started, 1)
+        self.assertTrue(mon.active)
+        self.assertEqual(seen[-1]["p"], {"D1": True})
+        self.assertEqual(seen[-1]["an"], {"A1": 1234})
 
 
 if __name__ == "__main__":

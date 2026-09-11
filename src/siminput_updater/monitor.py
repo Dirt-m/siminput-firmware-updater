@@ -210,26 +210,33 @@ class LiveMonitor:
 
     def _start(self) -> None:
         self._cancel_retry()
+        # Fresh state *before* the stream starts: the first frame (the pin
+        # snapshot) can arrive on the reader thread before start_stream even
+        # returns, and it must land in the merger that is kept, not in one
+        # about to be replaced. Whether evdev is the button/axis source is
+        # only known once the stream is up, so that flag is set afterwards.
+        with self._lock:
+            self._merger = StateMerger()
+            self._pending = None
+            self._pending_changed = set()
+            self._delivery_scheduled = False
+        now = time.monotonic()
+        self._last_frame = now
+        self._last_rearm = now
+        self._active = True
         try:
             self.app.device.start_stream(
                 self._on_frame, interval_ms=STREAM_INTERVAL_MS,
                 on_end=self._on_stream_died,
             )
         except Exception as e:
+            self._active = False
             log.warning("live monitor failed to start: %s", e)
             self.app.show_status(f"Live monitor unavailable: {e}", "error")
             self._schedule_retry()
             return
         with self._lock:
-            self._merger = StateMerger(
-                evdev_active=bool(getattr(self.app.device, "stream_uses_evdev", False)))
-            self._pending = None
-            self._pending_changed = set()
-            self._delivery_scheduled = False
-        self._active = True
-        now = time.monotonic()
-        self._last_frame = now
-        self._last_rearm = now
+            self._merger.evdev_active = bool(getattr(self.app.device, "stream_uses_evdev", False))
         self._schedule_watchdog()
 
     def _stop(self) -> None:
