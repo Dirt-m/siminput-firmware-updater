@@ -75,6 +75,47 @@ def _parse_curve(text: str):
         return text
 
 
+class _Tooltip:
+    """One small floating label per toplevel, shown next to a field on hover.
+    Errors live here instead of in a row under the card, so a mistake never
+    changes the card's height."""
+
+    _instances: dict[str, "_Tooltip"] = {}
+
+    def __init__(self, root):
+        self._win: tk.Toplevel | None = None
+        self._label: tk.Label | None = None
+        self._root = root
+
+    @classmethod
+    def for_widget(cls, widget) -> "_Tooltip":
+        root = widget.winfo_toplevel()
+        key = str(root)
+        tip = cls._instances.get(key)
+        if tip is None or (tip._win is not None and not tip._win.winfo_exists()):
+            tip = cls._instances[key] = cls(root)
+        return tip
+
+    def show(self, widget, text: str):
+        if self._win is None or not self._win.winfo_exists():
+            self._win = tk.Toplevel(self._root)
+            self._win.overrideredirect(True)
+            self._label = tk.Label(self._win, justify="left", padx=8, pady=5, wraplength=t.px(widget, 360))
+        self._label.configure(text=text, bg=t.resolve(t.ERROR_SOFT), fg=t.resolve(t.ERROR),
+                              font=t.tk_font(widget, 12))
+        self._win.configure(bg=t.resolve(t.ERROR))
+        x = widget.winfo_rootx()
+        y = widget.winfo_rooty() + widget.winfo_height() + 4
+        self._label.pack(padx=1, pady=1)
+        self._win.geometry(f"+{x}+{y}")
+        self._win.deiconify()
+        self._win.lift()
+
+    def hide(self):
+        if self._win is not None and self._win.winfo_exists():
+            self._win.withdraw()
+
+
 def _entry(master, bg: str, width=78):
     return ctk.CTkEntry(master, width=width, height=30, corner_radius=t.RADIUS, bg_color=bg,
                         fg_color=t.SURFACE_3, border_color=t.BORDER, font=t.mono(12))
@@ -163,7 +204,7 @@ class RuleCard(tk.Frame):
         self.rule = rule
         self._widgets: dict[str, object] = {}
         self._errors: dict[str, str] = {}
-        self._err_label: tk.Label | None = None
+        self._tips: dict[int, str] = {}   # id(widget) → message shown on hover
         self._learn_glyphs: dict[str, Glyph] = {}
         self._plain: list[tk.Widget] = []     # plain-tk children to retheme
         self._ctk_children: list = []          # CTk children needing bg_color sync
@@ -264,7 +305,7 @@ class RuleCard(tk.Frame):
             self._summary()
         elif tp == "NOR":
             r = self._row()
-            self._field(r, "Inputs (any of)", lambda p: self._list(p, "inputs", self.rule.inputs),
+            self._field(r, "Inputs (comma separated)", lambda p: self._list(p, "inputs", self.rule.inputs),
                         learn="inputs")
             self._arrow(r)
             self._field(r, "Output", lambda p: self._pin(p, "output", self.rule.output))
@@ -354,9 +395,20 @@ class RuleCard(tk.Frame):
 
     def _bind_entry(self, e):
         e.bind("<KeyRelease>", lambda _e: self._sync())
+        e.bind("<FocusOut>", lambda _e: self.editor.page._schedule_validate())
         e.bind("<Alt-Up>", lambda _e: self._nudge(-1))
         e.bind("<Alt-Down>", lambda _e: self._nudge(1))
+        self._bind_tip(e)
         self._ctk_children.append(e)
+
+    def _bind_tip(self, widget):
+        widget.bind("<Enter>", lambda _e, w=widget: self._show_tip(w), add="+")
+        widget.bind("<Leave>", lambda _e, w=widget: _Tooltip.for_widget(w).hide(), add="+")
+
+    def _show_tip(self, widget):
+        text = self._tips.get(id(widget))
+        if text:
+            _Tooltip.for_widget(widget).show(widget, text)
 
     def _pin(self, parent, key, current):
         e = _entry(parent, self._bg, width=78)
@@ -375,6 +427,7 @@ class RuleCard(tk.Frame):
 
     def _list(self, parent, key, current):
         e = _entry(parent, self._bg, width=200)
+        e.configure(placeholder_text="D3, D4, …")
         if current:
             e.insert(0, ", ".join(current))
         self._bind_entry(e)
@@ -410,6 +463,7 @@ class RuleCard(tk.Frame):
         picker.set(current or choices[0])
         self._widgets["input"] = picker
         self._plain.append(picker)
+        self._bind_tip(picker)
         return picker
 
     def _mode(self, parent):
@@ -434,6 +488,7 @@ class RuleCard(tk.Frame):
         picker.set(current or choices[0])
         self._widgets["axis"] = picker
         self._plain.append(picker)
+        self._bind_tip(picker)
         return picker
 
     def refresh_axis_choices(self):
@@ -565,12 +620,14 @@ class RuleCard(tk.Frame):
 
     # ---------------------------------------------------------- validation
 
-    def set_errors(self, errors: dict[str, str]):
+    def set_errors(self, errors: dict[str, str], focused=None) -> set[str]:
         """`errors` maps a validator field ("input", "inputs[1]", "cw", …) to
-        its message. Outlines the offending widgets and shows the messages
-        under the fields; an empty dict clears everything."""
+        its message. Outlines the offending widgets and attaches the message
+        as a hover tooltip; an empty dict clears everything. Fields whose
+        widget holds `focused` are skipped and returned, so a value still
+        being typed is not flagged mid-word."""
         self._errors = dict(errors)
-        self._apply_errors()
+        return self._apply_errors(focused)
 
     def _widget_for(self, field: str):
         """Validator field → the widget that edits it (None if not shown)."""
@@ -587,32 +644,30 @@ class RuleCard(tk.Frame):
             return w.get("threshold")
         return w.get(field)
 
-    def _apply_errors(self):
-        bad: set[int] = set()
-        for field in self._errors:
+    def _apply_errors(self, focused=None) -> set[str]:
+        focus_path = str(focused) if focused is not None else None
+        tips: dict[int, list[str]] = {}
+        suppressed: set[str] = set()
+        for field, message in self._errors.items():
             target = self._widget_for(field)
-            for widget in (target if isinstance(target, list) else [target]):
-                if widget is not None:
-                    bad.add(id(widget))
+            widgets = [x for x in (target if isinstance(target, list) else [target]) if x is not None]
+            if focus_path and any(focus_path.startswith(str(x)) for x in widgets):
+                suppressed.add(field)
+                continue
+            for widget in widgets:
+                tips.setdefault(id(widget), []).append(message)
+        self._tips = {k: "\n".join(dict.fromkeys(v)) for k, v in tips.items()}
         candidates = list(self._widgets.values()) + ([self.type_picker] if self.type_picker else [])
         for widget in candidates:
             if widget is None:
                 continue
-            is_bad = id(widget) in bad
+            is_bad = id(widget) in self._tips
             if isinstance(widget, ctk.CTkEntry):
                 widget.configure(border_color=t.ERROR if is_bad else t.BORDER)
             elif isinstance(widget, Picker):
                 widget.configure(highlightthickness=1 if is_bad else 0,
                                  highlightbackground=t.resolve(t.ERROR))
-        messages = list(dict.fromkeys(self._errors.values()))
-        if messages:
-            if self._err_label is None or not self._err_label.winfo_exists():
-                self._err_label = tk.Label(self.body, anchor="w", justify="left", bg=self._bg,
-                                           fg=t.resolve(t.ERROR), font=self._cap_font)
-            self._err_label.configure(text="  ·  ".join(messages), bg=self._bg, fg=t.resolve(t.ERROR))
-            self._err_label.grid(row=1, column=0, columnspan=2, sticky="w", pady=(4, 0))
-        elif self._err_label is not None and self._err_label.winfo_exists():
-            self._err_label.grid_remove()
+        return suppressed
 
     def set_learning(self, key: str | None):
         """Highlight the Learn button of `key` (None clears)."""
@@ -897,12 +952,17 @@ class RuleEditor(ctk.CTkFrame):
     def index_of(self, card: RuleCard) -> int:
         return self._cards.index(card)
 
-    def set_errors(self, errors: dict[int, dict[str, str]]):
+    def set_errors(self, errors: dict[int, dict[str, str]], focused=None) -> set[tuple[int, str]]:
         """Per-rule validation errors, keyed by rule index (the validator's
-        rules[i] — comments keep their slot, so indices match cards 1:1)."""
+        rules[i] — comments keep their slot, so indices match cards 1:1).
+        Returns the (index, field) pairs left unflagged because that field
+        currently has keyboard focus."""
         self._errors = errors
+        suppressed: set[tuple[int, str]] = set()
         for i, card in enumerate(self._cards):
-            card.set_errors(errors.get(i, {}))
+            for field in card.set_errors(errors.get(i, {}), focused=focused):
+                suppressed.add((i, field))
+        return suppressed
 
     def reveal(self, index: int, field: str | None = None):
         """Scroll a rule into view and focus the field a validator path names."""

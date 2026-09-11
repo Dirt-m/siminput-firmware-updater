@@ -54,8 +54,8 @@ def _option(master, values, command=None, width=160):
     )
 
 
-VALIDATE_DELAY_MS = 250   # debounce after the last keystroke
-MAX_PROBLEM_ROWS = 8
+VALIDATE_DELAY_MS = 700   # quiet time after the last keystroke before checking
+MAX_PROBLEM_ROWS = 10
 
 _PATH_RE = re.compile(r"^(\w+)(?:\[(\d+)\])?(?:\.(.+))?$")
 
@@ -93,6 +93,11 @@ def describe_problem(err: ValidationError) -> tuple[str, str]:
     if section == "device":
         return ("Device", err.message)
     return ("Config", err.message)
+
+
+def _suppressed(err: ValidationError, suppressed: set[tuple[int, str]]) -> bool:
+    section, idx, field = parse_path(err.path)
+    return section == "rules" and idx is not None and (idx, field or "type") in suppressed
 
 
 def _slider(master, **kw):
@@ -144,6 +149,7 @@ class ConfigurePage(ctk.CTkFrame):
         bar = ctk.CTkFrame(self, fg_color=t.SURFACE, corner_radius=t.RADIUS, height=58)
         bar.grid(row=0, column=0, sticky="ew")
         bar.grid_columnconfigure(5, weight=1)
+        self._toolbar = bar
 
         self._read_btn = t.primary_button(bar, "Read from device", self._read_config, width=150)
         self._read_btn.grid(row=0, column=0, padx=(14, 8), pady=12)
@@ -158,8 +164,16 @@ class ConfigurePage(ctk.CTkFrame):
         self._export_btn = t.ghost_button(bar, "Export JSON", self._export_json, width=110)
         self._export_btn.grid(row=0, column=4, pady=12)
 
+        # Problems are announced here as a count that never moves the layout;
+        # clicking it floats the list over the page instead of pushing it down.
+        self._problems_btn = ctk.CTkButton(
+            bar, text="", height=30, corner_radius=t.RADIUS, fg_color="transparent",
+            hover_color=t.ERROR_SOFT, text_color=t.ERROR, font=t.font(12, "bold"),
+            command=self._toggle_problems)
+        self._problems_btn.grid(row=0, column=5, padx=(16, 4), pady=12, sticky="e")
+        self._problems_btn.grid_remove()
         self.dirty_label = ctk.CTkLabel(bar, text="", font=t.font(12, "bold"), text_color=t.WARN, anchor="e")
-        self.dirty_label.grid(row=0, column=5, padx=16, pady=12, sticky="e")
+        self.dirty_label.grid(row=0, column=6, padx=16, pady=12, sticky="e")
 
     def _create_tabs(self):
         self._tab_names = ("Device", "Variables", "Axes", "Rules")
@@ -221,24 +235,40 @@ class ConfigurePage(ctk.CTkFrame):
     # -------------------------------------------------------- problems panel
 
     def _create_problems_panel(self):
+        """The floating problem list. Never gridded: it is place()d over the
+        tabs when opened, so the rest of the page never shifts."""
         self._problems_panel = ctk.CTkFrame(
-            self, fg_color=t.ERROR_SOFT, corner_radius=t.RADIUS, border_width=1, border_color=t.ERROR)
-        self._problems_panel.grid(row=1, column=0, sticky="ew", pady=(12, 0))
+            self, fg_color=t.SURFACE_2, corner_radius=t.RADIUS, border_width=1, border_color=t.ERROR)
         self._problems_panel.grid_columnconfigure(0, weight=1)
-        self._problems_panel.grid_remove()
-        self._problems_title = ctk.CTkLabel(
-            self._problems_panel, text="", anchor="w", font=t.font(12, "bold"), text_color=t.ERROR)
-        self._problems_title.grid(row=0, column=0, padx=14, pady=(8, 3), sticky="w")
+        head = ctk.CTkFrame(self._problems_panel, fg_color="transparent")
+        head.grid(row=0, column=0, sticky="ew", padx=14, pady=(8, 2))
+        head.grid_columnconfigure(0, weight=1)
+        self._problems_title = ctk.CTkLabel(head, text="", anchor="w", font=t.font(12, "bold"), text_color=t.ERROR)
+        self._problems_title.grid(row=0, column=0, sticky="w")
+        ctk.CTkButton(head, text="✕", width=26, height=22, corner_radius=t.RADIUS, fg_color="transparent",
+                      hover_color=t.HOVER, text_color=t.TEXT_DIM, font=t.font(12),
+                      command=self._close_problems).grid(row=0, column=1, sticky="e")
         self._problem_rows: list[ctk.CTkLabel] = []
+        self._problems_open = False
+        self.app.bind("<Escape>", lambda _e: self._close_problems(), add="+")
 
     def _show_problems(self, errors: list[ValidationError]):
         self._problems = list(errors)
+        n = len(errors)
+        if not errors:
+            self._problems_btn.grid_remove()
+            self._close_problems()
+            return
+        self._problems_btn.configure(text=f"{n} problem{'s' if n != 1 else ''}  ▾")
+        self._problems_btn.grid()
+        if self._problems_open:
+            self._render_problem_rows()
+
+    def _render_problem_rows(self):
         for row in self._problem_rows:
             row.destroy()
         self._problem_rows = []
-        if not errors:
-            self._problems_panel.grid_remove()
-            return
+        errors = self._problems
         n = len(errors)
         self._problems_title.configure(text=f"{n} problem{'s' if n != 1 else ''} to fix before saving")
         for i, err in enumerate(errors[:MAX_PROBLEM_ROWS]):
@@ -246,15 +276,41 @@ class ConfigurePage(ctk.CTkFrame):
             row = ctk.CTkLabel(
                 self._problems_panel, text=f"{where}:  {what}", anchor="w", cursor="hand2",
                 font=t.font(12), text_color=t.TEXT, height=18)
-            row.grid(row=i + 1, column=0, padx=14, pady=(0, 8 if i == n - 1 else 1), sticky="w")
-            row.bind("<Button-1>", lambda _e, e=err: self._goto_problem(e))
+            row.grid(row=i + 1, column=0, padx=14, pady=(0, 10 if i == min(n, MAX_PROBLEM_ROWS) - 1 else 1),
+                     sticky="w")
+            row.bind("<Button-1>", lambda _e, e=err: self._pick_problem(e))
             self._problem_rows.append(row)
         if n > MAX_PROBLEM_ROWS:
             more = ctk.CTkLabel(self._problems_panel, text=f"+{n - MAX_PROBLEM_ROWS} more", anchor="w",
                                 font=t.font(12), text_color=t.TEXT_DIM, height=18)
-            more.grid(row=MAX_PROBLEM_ROWS + 1, column=0, padx=14, pady=(0, 8), sticky="w")
+            more.grid(row=MAX_PROBLEM_ROWS + 1, column=0, padx=14, pady=(0, 10), sticky="w")
             self._problem_rows.append(more)
-        self._problems_panel.grid()
+
+    def _toggle_problems(self):
+        if self._problems_open:
+            self._close_problems()
+        else:
+            self._open_problems()
+
+    def _open_problems(self):
+        if not self._problems:
+            return
+        self._problems_open = True
+        self._render_problem_rows()
+        self.update_idletasks()
+        y = self._toolbar.winfo_y() + self._toolbar.winfo_height() + 6
+        self._problems_panel.place(x=0, y=y, relwidth=1.0)
+        self._problems_panel.lift()
+
+    def _close_problems(self):
+        if not self._problems_open:
+            return
+        self._problems_open = False
+        self._problems_panel.place_forget()
+
+    def _pick_problem(self, err: ValidationError):
+        self._close_problems()
+        self._goto_problem(err)
 
     def _goto_problem(self, err: ValidationError):
         section, idx, field = parse_path(err.path)
@@ -322,13 +378,22 @@ class ConfigurePage(ctk.CTkFrame):
                 bad_vars.add(idx)
             elif section == "axes" and idx is not None and field == "id":
                 bad_axes.add(idx)
-        self.rule_editor.set_errors(rule_errors)
+        # The field being typed in is left alone until focus leaves it: half
+        # a pin name is not a mistake yet.
+        try:
+            # focus_lastfor, not focus_get: the field keeps its claim while
+            # the window itself is momentarily inactive.
+            focused = self.winfo_toplevel().focus_lastfor()
+        except Exception:
+            focused = None
+        suppressed = self.rule_editor.set_errors(rule_errors, focused=focused)
         for i, w in enumerate(self._var_widgets):
             w["name"].configure(border_color=t.ERROR if i in bad_vars else t.BORDER)
         for i, w in enumerate(self._axis_widgets):
             w["name"].configure(border_color=t.ERROR if i in bad_axes else t.BORDER)
-        self._show_problems(errors)
-        return errors
+        shown = [e for e in errors if not _suppressed(e, suppressed)]
+        self._show_problems(shown)
+        return shown
 
     # -- Device tab --
 
@@ -406,6 +471,7 @@ class ConfigurePage(ctk.CTkFrame):
         if bv.id:
             name_entry.insert(0, bv.id)
         name_entry.bind("<KeyRelease>", lambda e: self._mark_dirty())
+        name_entry.bind("<FocusOut>", lambda e: self._schedule_validate())
 
         default_switch = _switch(frame, "Starts on", command=self._mark_dirty)
         default_switch.grid(row=0, column=2, padx=12, pady=10)
@@ -486,6 +552,7 @@ class ConfigurePage(ctk.CTkFrame):
         if ax.id:
             name_entry.insert(0, ax.id)
         name_entry.bind("<KeyRelease>", lambda e: self._mark_dirty())
+        name_entry.bind("<FocusOut>", lambda e: self._schedule_validate())
 
         ctk.CTkLabel(frame, text="Output", font=t.font(12), text_color=t.TEXT_DIM).grid(
             row=0, column=2, padx=(14, 6), pady=10)
@@ -767,12 +834,10 @@ class ConfigurePage(ctk.CTkFrame):
         self.app.run_operation("Reading configuration", work, on_success=on_success, success_message="Loaded")
 
     def _save_config(self):
+        self.focus_set()  # commit the field being typed in
         errors = self._validate_now()
         if errors:
-            n = len(errors)
-            self.app.show_status(
-                f"Fix the {n} problem{'s' if n != 1 else ''} listed above before saving", "error", 6000)
-            self._goto_problem(errors[0])
+            self._open_problems()
             return
         config = self._collect_config()
         if not self.app.device.connected:
