@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import queue
 import threading
 import webbrowser
 from typing import Callable
@@ -8,6 +9,7 @@ import customtkinter as ctk
 
 from . import ui_theme as t
 from .applog import log
+from .monitor import LiveMonitor
 from .operations import OperationCancelled, OperationContext
 from .widgets.overlay import BusyOverlay
 from .pages.device_page import DevicePage
@@ -26,6 +28,7 @@ CONNECT_COOLDOWN_TICKS = 3     # ticks a port sits out of auto-connect after fai
 LABEL_SEARCHING = "Searching for devices…"
 FIRMWARE_RELEASES_URL = "https://github.com/Dirt-m/siminput-firmware-v2/releases"
 CONNECTABLE = ("ok", "no_response")
+UI_QUEUE_POLL_MS = 33   # ~30 fps; the rate worker callbacks reach the UI
 
 
 class App(ctk.CTk):
@@ -56,6 +59,11 @@ class App(ctk.CTk):
         self._fail_counts: dict[str, int] = {}  # port -> consecutive failed connects
         self._operation_active = False         # a run_operation is in flight
         self._closing = False
+        self._ui_queue: queue.SimpleQueue = queue.SimpleQueue()
+
+        # Owns the live input stream for every page; must exist before the
+        # pages, which subscribe to it as they are built and shown.
+        self.monitor = LiveMonitor(self)
 
         self.grid_columnconfigure(1, weight=1)
         self.grid_rowconfigure(1, weight=1)
@@ -76,7 +84,37 @@ class App(ctk.CTk):
 
         self._show_page("device")
         self._refresh_connection_view()
+        self._drain_ui_queue()
         self._scan_tick()
+
+    # ------------------------------------------------------------- UI thread
+
+    def post(self, fn: Callable[[], None]) -> None:
+        """Run `fn` on the UI thread, from any thread.
+
+        Deliberately not `after(0, ...)`: with a threaded Tcl (Tk 9) a timer
+        created from a worker thread is registered against that thread's
+        notifier, so the callback fires late or never. It looked like it
+        worked because short-lived workers happened to get serviced, while the
+        live monitor's long-lived reader thread had its updates dropped
+        wholesale. Worker callbacks go through a queue the main thread drains.
+        """
+        if self._closing:
+            return
+        self._ui_queue.put(fn)
+
+    def _drain_ui_queue(self):
+        while True:
+            try:
+                fn = self._ui_queue.get_nowait()
+            except queue.Empty:
+                break
+            try:
+                fn()
+            except Exception:
+                log.exception("queued UI callback failed")
+        if not self._closing:
+            self.after(UI_QUEUE_POLL_MS, self._drain_ui_queue)
 
     def report_callback_exception(self, exc, val, tb):
         """Tk routes exceptions raised inside event callbacks here. The
@@ -105,6 +143,10 @@ class App(ctk.CTk):
             ):
                 return
         self._closing = True
+        try:
+            self.monitor.shutdown()
+        except Exception:
+            pass
         try:
             self.device.disconnect()
         except Exception:
@@ -273,10 +315,7 @@ class App(ctk.CTk):
             self._sync_theme_button()
             for fn in self._theme_listeners:
                 fn()
-        try:
-            self.after(0, apply)
-        except Exception:
-            pass
+        self.post(apply)
 
     def _sync_theme_button(self):
         # The glyph shows the mode the button switches to.
@@ -378,11 +417,7 @@ class App(ctk.CTk):
                     except Exception:
                         devices = []
             finally:
-                if not self._closing:
-                    try:
-                        self.after(0, lambda: self._on_scan_result(ports, lost, devices))
-                    except Exception:
-                        pass
+                self.post(lambda: self._on_scan_result(ports, lost, devices))
 
         threading.Thread(target=work, daemon=True).start()
 
@@ -425,20 +460,24 @@ class App(ctk.CTk):
         self._connecting = True
         if self.device.connected:
             self.notify_disconnected()  # stop the monitor on the old device
+        # connect() reopens the port and pings it; a stream reader would eat
+        # the ping replies.
+        self.monitor.pause()
 
         def work():
             try:
                 info = self.device.connect(port)
                 full = self.device.get_info()
-                self.after(0, lambda: self._connect_done(info, full))
+                self.post(lambda: self._connect_done(info, full))
             except Exception as e:
                 msg = str(e)
-                self.after(0, lambda: self._connect_failed(port, msg))
+                self.post(lambda: self._connect_failed(port, msg))
 
         threading.Thread(target=work, daemon=True).start()
 
     def _connect_done(self, info, full):
         self._connecting = False
+        self.monitor.resume()
         self._cooldown.pop(info.port, None)
         self._fail_counts.pop(info.port, None)
         self.notify_connected(info, full)
@@ -446,6 +485,7 @@ class App(ctk.CTk):
 
     def _connect_failed(self, port: str, msg: str):
         self._connecting = False
+        self.monitor.resume()
         # Linear backoff per consecutive failure, capped: a non-SIMINPUT
         # CircuitPython board (or a box that never answers) must not produce
         # an endless connect/fail/toast loop every few seconds.
@@ -529,15 +569,12 @@ class App(ctk.CTk):
         cancel = threading.Event()
         ctx = OperationContext(self, cancel)
         self._operation_active = True  # pause scanning/auto-connect for the duration
+        # The stream and commands share one port and one reader; the stream
+        # has to be off before the worker sends anything.
+        self.monitor.pause()
         self.overlay.show(title, on_cancel=cancel.set, indeterminate=indeterminate)
 
-        def post(fn):
-            if self._closing:
-                return
-            try:
-                self.after(0, fn)
-            except RuntimeError:
-                pass  # window destroyed while the worker was finishing
+        post = self.post
 
         def runner():
             try:
@@ -570,6 +607,9 @@ class App(ctk.CTk):
             finally:
                 self._operation_active = False
                 self._refresh_connection_view()
+                # Last: the device may have rebooted and reconnected during the
+                # operation, so resuming re-issues stream_start from scratch.
+                self.monitor.resume()
         return wrapped
 
     # ---------------------------------------------------------------- toast

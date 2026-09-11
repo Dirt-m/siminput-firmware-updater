@@ -47,6 +47,10 @@ class MockDevice:
         self._axes: list[int] = [32767] * 8
         self._bools: dict[str, bool] = {}
         self._pins: dict[str, bool] = {}
+        self._snapshot_pending = False
+        self._stream_prev_btns: list[int] | None = None
+        self._stream_prev_axes: list[int] | None = None
+        self._stream_prev_pins: dict[str, bool] = {}
         self._update_staging: dict[str, bytes] | None = None
         self._init_state()
 
@@ -162,6 +166,10 @@ class MockDevice:
             "pins": dict(self._pins),
         }
 
+    @property
+    def stream_uses_evdev(self) -> bool:
+        return False
+
     def start_stream(
         self,
         callback: Callable[[dict], None],
@@ -170,6 +178,7 @@ class MockDevice:
     ):
         self.stop_stream()
         self._stream_callback = callback
+        self._reset_stream_baselines()
         self._streaming = True
         self._stream_thread = threading.Thread(target=self._stream_loop, args=(interval_ms,), daemon=True)
         self._stream_thread.start()
@@ -183,16 +192,53 @@ class MockDevice:
             self._stream_thread = None
         self._stream_callback = None
 
+    def rearm_stream(self) -> None:
+        """Like the firmware's stream_start on an already-running stream: the
+        change baselines are dropped, so the next frame is a full snapshot."""
+        if self._streaming:
+            self._reset_stream_baselines()
+
+    def _reset_stream_baselines(self):
+        self._snapshot_pending = True
+        self._stream_prev_btns = None
+        self._stream_prev_axes = None
+        self._stream_prev_pins = {}
+
     def _stream_loop(self, interval_ms: int):
         while self._streaming:
             self._simulate_tick()
-            if self._stream_callback:
-                self._stream_callback({
-                    "b": sorted(self._buttons),
-                    "a": list(self._axes),
-                    "p": {k: v for k, v in self._pins.items() if v},
-                })
+            frame = self._build_frame()
+            if frame is not None and self._stream_callback:
+                self._stream_callback(frame)
             time.sleep(interval_ms / 1000.0)
+
+    def _build_frame(self) -> dict | None:
+        """Mirror serial_handler.maybe_send_stream: a frame goes out only when
+        something changed, "p" carries only the pins that changed, and the
+        first frame after every stream_start is a full pin snapshot."""
+        btns = sorted(self._buttons)
+        axes = list(self._axes)
+        snapshot = self._snapshot_pending
+        if snapshot:
+            pins_changed = dict(self._pins)
+        else:
+            pins_changed = {k: v for k, v in self._pins.items()
+                            if self._stream_prev_pins.get(k) != v}
+        if not snapshot and not pins_changed \
+                and btns == self._stream_prev_btns and axes == self._stream_prev_axes:
+            return None
+
+        self._snapshot_pending = False
+        self._stream_prev_btns = btns
+        self._stream_prev_axes = axes
+        self._stream_prev_pins.update(pins_changed)
+
+        frame = {"src": "serial", "b": btns, "a": axes}
+        if pins_changed:
+            frame["p"] = pins_changed
+        if snapshot:
+            frame["snapshot"] = True
+        return frame
 
     def _simulate_tick(self):
         if random.random() < 0.1:

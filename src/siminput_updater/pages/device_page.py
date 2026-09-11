@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from typing import TYPE_CHECKING
 
 import customtkinter as ctk
@@ -12,22 +13,30 @@ if TYPE_CHECKING:
     from ..app import App
 
 AXIS_LABELS = ["X", "Y", "Z", "Rx", "Ry", "Rz", "Slider", "Dial"]
+MAX_PINS_SHOWN = 24
+
+
+def pin_sort_key(name: str) -> tuple:
+    """Natural order, so D2 sorts before D10."""
+    parts = re.split(r"(\d+)", name)
+    return tuple(int(p) if p.isdigit() else p for p in parts)
 
 
 class DevicePage(ctk.CTkFrame):
     """Device info + live input monitor.
 
     Connection is handled by the dropdown in the top-right header; this page
-    just reports what the connected device is and streams its live input. Both
+    just reports what the connected device is and renders live input. Both
     panels show an empty state until a device is connected.
+
+    The stream itself belongs to App.monitor — this page is a plain
+    subscriber that holds the monitor open while it is visible.
     """
 
     def __init__(self, parent, app: App):
         super().__init__(parent, fg_color="transparent")
         self.app = app
-        self._streaming = False
-        self._pending_state: dict | None = None
-        self._update_scheduled = False
+        self._subscribed = False
 
         self.grid_columnconfigure(0, weight=1)
         self.grid_rowconfigure(1, weight=1)
@@ -127,6 +136,21 @@ class DevicePage(ctk.CTkFrame):
             bar.grid(row=i, column=1, pady=4, sticky="ew")
             self.axis_bars.append(bar)
 
+        # Pins are the one thing evdev cannot see; they arrive over the serial
+        # stream on every platform now, so show them plainly until the shared
+        # live panel exists.
+        pins_wrap = ctk.CTkFrame(self._mon, fg_color="transparent")
+        pins_wrap.grid(row=2, column=0, columnspan=2, pady=(14, 2), sticky="ew")
+        pins_wrap.grid_columnconfigure(1, weight=1)
+        ctk.CTkLabel(pins_wrap, text="PINS", font=t.font(11, "bold"),
+                     text_color=t.TEXT_MUTED, anchor="w").grid(
+            row=0, column=0, padx=(2, 12), sticky="w")
+        self._pins_label = ctk.CTkLabel(
+            pins_wrap, text="—", font=t.mono(12), text_color=t.TEXT_DIM,
+            anchor="w", justify="left", wraplength=640,
+        )
+        self._pins_label.grid(row=0, column=1, sticky="w")
+
     def _section(self, parent, title: str, row: int, col: int):
         ctk.CTkLabel(parent, text=title, font=t.font(11, "bold"), text_color=t.TEXT_MUTED, anchor="w").grid(
             row=row, column=col, padx=2, pady=(2, 8), sticky="w")
@@ -134,23 +158,25 @@ class DevicePage(ctk.CTkFrame):
     # ------------------------------------------------------------- lifecycle
 
     def on_show(self):
-        if self.app.device.connected and not self._streaming:
-            self._start_stream()
+        # Hold the shared stream open only while this page is visible; the
+        # monitor refcounts pages and stops the device stream at zero.
+        if self._subscribed:
+            return
+        self._subscribed = True
+        self.app.monitor.subscribe(self._render)
+        self.app.monitor.acquire()
 
     def on_hide(self):
-        self._stop_stream()
+        if not self._subscribed:
+            return
+        self._subscribed = False
+        self.app.monitor.unsubscribe(self._render)
+        self.app.monitor.release()
 
     def _on_connection_changed(self, connected: bool):
         self._sync_connection_view()
-        if connected:
-            # Only stream while this page is actually visible. Starting a
-            # hidden stream leaves (on Windows, where monitoring runs over
-            # serial) a reader thread consuming the very responses the other
-            # pages' commands are waiting for.
-            if self.app._current_page == "device":
-                self._start_stream()
-        else:
-            self._stop_stream()
+        if not connected:
+            self._render_pins({})
 
     def _sync_connection_view(self):
         if self.app.device.connected and self.app.device.info:
@@ -182,63 +208,23 @@ class DevicePage(ctk.CTkFrame):
 
     # --------------------------------------------------------------- stream
 
-    def _start_stream(self):
-        if self._streaming or not self.app.device.connected:
-            return
-        try:
-            self.app.device.start_stream(
-                self._on_state_update, interval_ms=50, on_end=self._on_stream_died,
-            )
-            self._streaming = True
-        except Exception as e:
-            self.app.show_status(f"Stream error: {e}", "error")
-
-    def _stop_stream(self):
-        if not self._streaming:
-            return
-        try:
-            self.app.device.stop_stream()
-        except Exception:
-            pass
-        self._streaming = False
-
-    def _on_stream_died(self):
-        """The reader thread exited unexpectedly (device vanished, evdev node
-        closed). Reset so the monitor can restart instead of freezing."""
-        def retry():
-            if self.app.device.connected and self.app._current_page == "device":
-                self._start_stream()
-
-        def apply():
-            self._streaming = False
-            if self.app.device.connected and self.app._current_page == "device":
-                self.app.show_status("Live monitor stopped — restarting…", "info")
-                # Delayed retry, not immediate: a dead device would otherwise
-                # spin start/die cycles as fast as the event loop allows.
-                self.after(1000, retry)
-        try:
-            self.after(0, apply)
-        except RuntimeError:
-            pass
-
-    def _on_state_update(self, state: dict):
-        # Coalesce: the evdev reader can fire per input event (hundreds of Hz);
-        # keep only the latest state and at most one queued UI update.
-        self._pending_state = state
-        if not self._update_scheduled:
-            self._update_scheduled = True
-            try:
-                self.after(0, self._apply_pending)
-            except RuntimeError:
-                self._update_scheduled = False
-
-    def _apply_pending(self):
-        self._update_scheduled = False
-        state = self._pending_state
-        if state is None or not self._streaming:
-            return
-        self.button_grid.update_buttons(set(state.get("b", [])))
-
-        for i, val in enumerate(state.get("a", [])):
+    def _render(self, state: dict):
+        """Monitor subscriber — already on the UI thread and already coalesced."""
+        self.button_grid.update_buttons(set(state.get("b", ())))
+        for i, val in enumerate(state.get("a", ())):
             if i < len(self.axis_bars):
                 self.axis_bars[i].set_value(val)
+        self._render_pins(state.get("p") or {})
+
+    def _render_pins(self, pins: dict):
+        pressed = sorted((name for name, on in pins.items() if on), key=pin_sort_key)
+        if not pressed:
+            # An empty dict before the first snapshot means "not known yet";
+            # either way there is nothing to list.
+            self._pins_label.configure(text="none pressed", text_color=t.TEXT_MUTED)
+            return
+        shown = pressed[:MAX_PINS_SHOWN]
+        text = "  ".join(shown)
+        if len(pressed) > len(shown):
+            text += f"  +{len(pressed) - len(shown)} more"
+        self._pins_label.configure(text=text, text_color=t.TEXT)
