@@ -14,6 +14,8 @@ from typing import Any, Callable, Protocol
 import serial
 import serial.tools.list_ports
 
+from .applog import log
+
 try:
     import evdev
     import evdev.ecodes as ec
@@ -83,9 +85,12 @@ class Device:
         self._port: serial.Serial | None = None
         self._info: DeviceInfo | None = None
         self._streaming = False
-        self._stream_thread: threading.Thread | None = None
+        self._serial_streaming = False
+        self._stream_threads: list[threading.Thread] = []
         self._stream_callback: Callable[[dict], None] | None = None
         self._stream_end_callback: Callable[[], None] | None = None
+        self._stream_interval_ms = 50
+        self._snapshot_pending = False
         self._lock = threading.Lock()          # serial message traffic
         self._conn_lock = threading.RLock()    # connect/disconnect lifecycle
         self._keepalive_lock = threading.Lock()
@@ -499,6 +504,7 @@ class Device:
         connection quietly, without a stream_stop round trip."""
         with self._conn_lock:
             self._streaming = False
+            self._serial_streaming = False
             self._close_port()
 
     # -------------------------------------------------------------- commands
@@ -562,21 +568,50 @@ class Device:
 
     # ------------------------------------------------------------- streaming
 
+    @property
+    def stream_uses_evdev(self) -> bool:
+        """True while an evdev node is supplying buttons and axes."""
+        return self._evdev is not None
+
     def start_stream(
         self,
         callback: Callable[[dict], None],
         interval_ms: int = 50,
         on_end: Callable[[], None] | None = None,
     ):
-        """Start the live monitor. `on_end` fires if the reader dies
-        unexpectedly (device vanished), so the UI can show an error and reset
-        instead of freezing on stale data forever."""
+        """Start the live monitor. Frames are tagged with their source.
+
+        Two readers can run at once and each frame carries a "src" key:
+
+        * "evdev" (Linux only) — the HID node the box already exposes. Lowest
+          latency, but it carries buttons and axes only.
+        * "serial" — the JSON stream. The only source of physical pin states
+          ("p"), so it now runs on every platform, evdev or not.
+
+        MERGE RULE — enforced by monitor.StateMerger, which is the only thing
+        that should consume these frames: while evdev is active it is the sole
+        authority for "b" and "a", and the serial frames' "b"/"a" must be
+        IGNORED. The serial stream lags evdev by up to one stream interval, so
+        a late serial frame would otherwise un-press a button evdev has
+        already reported as down. Pins always come from the serial frames.
+
+        Serial "p" is changes-only, except for the first frame after every
+        stream_start, which is a full snapshot of the firmware's pin cache.
+        Those frames carry "snapshot": True so a consumer can set its baseline
+        without treating every pin as freshly transitioned. Pins claimed by
+        ENCODER rules are deinit'd by the firmware and read False forever.
+
+        `on_end` fires if a reader dies unexpectedly (device vanished), so the
+        UI can restart instead of freezing on stale data.
+        """
         self.stop_stream()
         self._stream_callback = callback
         self._stream_end_callback = on_end
+        self._stream_interval_ms = interval_ms
 
         self.ensure_keepalive()
         self._evdev = self._keepalive
+        threads: list[threading.Thread] = []
         if self._evdev:
             caps = self._evdev.capabilities()
             btn_codes = sorted(caps.get(ec.EV_KEY, []))
@@ -584,26 +619,47 @@ class Device:
             # which the firmware never drives. Numbering codes by index keeps
             # the monitor consistent with config B-names and the serial stream.
             self._btn_map = {code: i for i, code in enumerate(btn_codes)}
-            self._streaming = True
-            self._stream_thread = threading.Thread(target=self._evdev_reader, daemon=True)
-        else:
+            threads.append(threading.Thread(target=self._evdev_reader, daemon=True))
+
+        try:
             self._flush_input()
             self._send({"cmd": "stream_start", "interval_ms": interval_ms}, skip_acks=False)
-            self._streaming = True  # only after the device acknowledged
-            self._stream_thread = threading.Thread(target=self._serial_reader, daemon=True)
-        self._stream_thread.start()
+            self._serial_streaming = True  # only after the device acknowledged
+            self._snapshot_pending = True
+            # The first frame can land in the same read as the stream_start
+            # ack and sit in _rxbuf; hand it to the reader instead of dropping
+            # it, or the pin snapshot is lost until the next re-arm.
+            leftover, self._rxbuf = self._rxbuf, b""
+            threads.append(threading.Thread(
+                target=self._serial_reader, args=(leftover,), daemon=True))
+        except (DeviceError, serial.SerialException, OSError) as e:
+            # Firmware too old for "stream", or the port went away. With evdev
+            # the monitor still works minus pin states; without it there is
+            # nothing to show, so let the caller report the failure.
+            if not self._evdev:
+                self._stream_callback = None
+                self._stream_end_callback = None
+                raise
+            log.warning("pin stream unavailable, buttons/axes only: %s", e)
+
+        self._streaming = True
+        self._stream_threads = threads
+        for th in threads:
+            th.start()
 
     def stop_stream(self):
         if not self._streaming:
             return
         self._streaming = False
-        # Join the reader first so it can't race _send for the port.
-        if self._stream_thread:
-            self._stream_thread.join(timeout=2.0)
-            self._stream_thread = None
-        if not self._evdev:
-            # Short bounded round trip: this runs on the UI thread during page
-            # switches, so waiting a full response timeout would freeze the UI.
+        # Join the readers first so they can't race _send for the port.
+        for th in self._stream_threads:
+            th.join(timeout=2.0)
+        self._stream_threads = []
+        if self._serial_streaming:
+            self._serial_streaming = False
+            # Short bounded round trip: this runs on the UI thread before every
+            # operation and on page switches, so waiting a full response
+            # timeout would freeze the UI.
             try:
                 self._send({"cmd": "stream_stop"}, timeout=0.5, skip_acks=False)
             except (DeviceError, serial.SerialException, OSError, json.JSONDecodeError):
@@ -612,6 +668,33 @@ class Device:
         self._evdev = None
         self._stream_callback = None
         self._stream_end_callback = None
+
+    def rearm_stream(self) -> None:
+        """Re-issue stream_start on a stream that is already running.
+
+        The firmware clears its own _streaming flag on a failed or partial
+        write and never tells the host (serial_handler.maybe_send_stream), so
+        a stream can die silently. Re-issuing stream_start revives it; it also
+        resets the firmware's change baselines, so the next frame is a full
+        pin snapshot and is tagged as one.
+
+        Write-only on purpose: the reader thread owns the read side while
+        streaming, and it drains and discards the bare {"ok": true} reply.
+        """
+        if not (self._streaming and self._serial_streaming):
+            return
+        port = self._port
+        if port is None or not port.is_open:
+            return
+        with self._lock:
+            self._req_id += 1
+            msg = {"cmd": "stream_start", "interval_ms": self._stream_interval_ms,
+                   "id": self._req_id}
+            self._snapshot_pending = True
+            try:
+                self._write_line(json.dumps(msg).encode("utf-8") + b"\n")
+            except (serial.SerialException, OSError):
+                pass
 
     def _reader_ended(self):
         """Called from reader threads on exit. If streaming was still on, the
@@ -631,6 +714,11 @@ class Device:
         buttons: set[int] = set()
         dev = self._evdev
 
+        def emit():
+            cb = self._stream_callback
+            if cb:
+                cb({"src": "evdev", "a": list(axes), "b": sorted(buttons)})
+
         try:
             try:
                 caps = dev.capabilities(absinfo=True)
@@ -644,8 +732,7 @@ class Device:
             except (OSError, IOError, SystemError, ValueError):
                 pass
 
-            if self._stream_callback:
-                self._stream_callback({"a": list(axes), "b": sorted(buttons)})
+            emit()
 
             while self._streaming and dev:
                 try:
@@ -662,8 +749,8 @@ class Device:
                                     buttons.add(btn_num)
                                 else:
                                     buttons.discard(btn_num)
-                        elif event.type == ec.EV_SYN and self._stream_callback:
-                            self._stream_callback({"a": list(axes), "b": sorted(buttons)})
+                        elif event.type == ec.EV_SYN:
+                            emit()
                 except (OSError, IOError, ValueError):
                     # ValueError: a closed fd handed to select. Either way the
                     # node is gone — report it rather than dying silently.
@@ -671,28 +758,46 @@ class Device:
         finally:
             self._reader_ended()
 
-    def _serial_reader(self):
-        buf = b""
+    def _serial_reader(self, initial: bytes = b""):
+        """Drain the port continuously while streaming.
+
+        Draining is not optional: the firmware writes frames with a 0.5 s
+        write timeout from inside its 200 Hz main loop, so a host that stops
+        reading stalls the box for up to half a second per frame.
+        """
+        buf = initial
         try:
             while self._streaming and self._port and self._port.is_open:
                 try:
                     n = self._port.in_waiting
                     if n:
                         buf += self._port.read(n)
-                        while b"\n" in buf:
-                            line, buf = buf.split(b"\n", 1)
-                            if not line:
-                                continue
-                            try:
-                                msg = json.loads(line.decode("utf-8", errors="replace"))
-                            except json.JSONDecodeError:
-                                continue  # partial or non-JSON line — skip, keep streaming
-                            if "s" in msg and self._stream_callback:
-                                self._stream_callback(msg["s"])
-                    else:
+                    elif b"\n" not in buf:
                         time.sleep(0.005)
+                        continue
                 except (serial.SerialException, OSError):
                     break
+                while b"\n" in buf:
+                    line, buf = buf.split(b"\n", 1)
+                    if not line.strip():
+                        continue
+                    try:
+                        msg = json.loads(line.decode("utf-8", errors="replace"))
+                    except json.JSONDecodeError:
+                        continue  # partial or non-JSON line — skip, keep streaming
+                    if not isinstance(msg, dict):
+                        continue
+                    state = msg.get("s")
+                    if not isinstance(state, dict):
+                        continue  # e.g. the bare ok from a re-armed stream
+                    frame = dict(state)
+                    frame["src"] = "serial"
+                    if self._snapshot_pending:
+                        self._snapshot_pending = False
+                        frame["snapshot"] = True
+                    cb = self._stream_callback
+                    if cb:
+                        cb(frame)
         finally:
             self._reader_ended()
 
@@ -785,6 +890,7 @@ class Device:
         finally:
             with self._conn_lock:
                 self._streaming = False
+                self._serial_streaming = False
                 self._close_port()
 
     def enter_bootloader(self) -> None:
@@ -902,10 +1008,15 @@ class DeviceLike(Protocol):
 
     def set_config(self, config: dict) -> dict: ...
 
+    @property
+    def stream_uses_evdev(self) -> bool: ...
+
     def start_stream(self, callback: Callable[[dict], None], interval_ms: int = 50,
                      on_end: Callable[[], None] | None = None) -> None: ...
 
     def stop_stream(self) -> None: ...
+
+    def rearm_stream(self) -> None: ...
 
     def update_begin(self) -> None: ...
 

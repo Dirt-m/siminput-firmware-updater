@@ -11,6 +11,7 @@ import os
 import shutil
 import sys
 import tempfile
+import threading
 import time
 import types
 import unittest
@@ -19,10 +20,19 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "src"))
 
-FW_REPO = Path(os.environ.get("SIMINPUT_FW_PATH",
-                              REPO.parent.parent.parent / "siminput-firmware-v2"))
-if not (FW_REPO / "lib" / "serial_handler.py").exists():
-    FW_REPO = REPO.parent / "siminput-firmware-v2"
+def _find_firmware() -> Path:
+    env = os.environ.get("SIMINPUT_FW_PATH")
+    if env:
+        return Path(env)
+    # Walk up so this also resolves from a git worktree under .claude/.
+    for base in [REPO, *REPO.parents]:
+        candidate = base.parent / "siminput-firmware-v2"
+        if (candidate / "lib" / "serial_handler.py").exists():
+            return candidate
+    return REPO.parent / "siminput-firmware-v2"
+
+
+FW_REPO = _find_firmware()
 HAVE_FW = (FW_REPO / "lib" / "serial_handler.py").exists()
 
 if HAVE_FW:
@@ -58,22 +68,30 @@ class FakeBox:
 
 
 class FirmwareData:
-    def __init__(self):
+    """The firmware's end of the wire. Both buffers are lock-guarded: once the
+    device streams, its reader thread reads to_host while the test thread (or
+    the pump) writes it."""
+
+    def __init__(self, lock):
+        self.lock = lock
         self.to_host = b""
         self.from_host = b""
         self.write_timeout = None
 
     @property
     def in_waiting(self):
-        return len(self.from_host)
+        with self.lock:
+            return len(self.from_host)
 
     def read(self, n):
-        out, self.from_host = self.from_host[:n], self.from_host[n:]
-        return out
+        with self.lock:
+            out, self.from_host = self.from_host[:n], self.from_host[n:]
+            return out
 
     def write(self, b):
-        self.to_host += bytes(b)
-        return len(b)
+        with self.lock:
+            self.to_host += bytes(b)
+            return len(b)
 
     def flush(self):
         pass
@@ -81,37 +99,73 @@ class FirmwareData:
 
 class HostPort:
     """Quacks like pyserial; every write is pumped through the firmware
-    handler synchronously so replies are immediately readable."""
+    handler synchronously so replies are immediately readable.
 
-    def __init__(self, handler, fw_data):
+    The pump lock keeps the handler single-threaded: a background Pump may be
+    turning the firmware's main loop at the same time a test thread writes.
+    """
+
+    def __init__(self, handler, fw_data, lock):
         self.handler = handler
         self.fw = fw_data
+        self.lock = lock
+        self.pump_lock = threading.RLock()
         self.is_open = True
         self.timeout = 3.0
         self.write_timeout = 5.0
 
     @property
     def in_waiting(self):
-        return len(self.fw.to_host)
+        with self.lock:
+            return len(self.fw.to_host)
 
     def read(self, n):
-        out, self.fw.to_host = self.fw.to_host[:n], self.fw.to_host[n:]
-        return out
+        with self.lock:
+            out, self.fw.to_host = self.fw.to_host[:n], self.fw.to_host[n:]
+            return out
+
+    def pump(self):
+        """One turn of the firmware main loop: drain commands, then offer a
+        stream frame (a no-op unless streaming)."""
+        with self.pump_lock:
+            while self.fw.in_waiting:
+                self.handler.process()
+            self.handler.maybe_send_stream()
 
     def write(self, b):
-        self.fw.from_host += bytes(b)
-        while self.fw.in_waiting:
-            self.handler.process()
+        with self.lock:
+            self.fw.from_host += bytes(b)
+        self.pump()
         return len(b)
 
     def flush(self):
         pass
 
     def reset_input_buffer(self):
-        self.fw.to_host = b""
+        with self.lock:
+            self.fw.to_host = b""
 
     def close(self):
         self.is_open = False
+
+
+class Pump(threading.Thread):
+    """Turns the firmware main loop in the background so stream frames appear
+    without the host having to write anything."""
+
+    def __init__(self, port):
+        super().__init__(daemon=True)
+        self.port = port
+        self._halt = threading.Event()   # not _stop: Thread already owns that
+
+    def run(self):
+        while not self._halt.is_set():
+            self.port.pump()
+            time.sleep(0.002)
+
+    def halt(self):
+        self._halt.set()
+        self.join(timeout=2.0)
 
 
 @unittest.skipUnless(HAVE_FW, "sibling firmware repo not found")
@@ -125,15 +179,27 @@ class ProtocolIntegration(unittest.TestCase):
             json.dump({"device": {"name": "ProtoBox", "pid": 0xF001}}, f)
         with open("code.py", "w") as f:
             f.write("# old\n")
-        self.h = serial_handler.SerialHandler(FakeBox())
-        self.fw = FirmwareData()
+        self.box = FakeBox()
+        self.h = serial_handler.SerialHandler(self.box)
+        self.wire_lock = threading.RLock()
+        self.fw = FirmwareData(self.wire_lock)
         self.h._data = self.fw
         self.h._buf = bytearray(serial_handler._MAX_LINE)
         self.h._hash_algo = "sha256"
         self.d = Device()
-        self.d._port = HostPort(self.h, self.fw)
+        self.d._port = self.port = HostPort(self.h, self.fw, self.wire_lock)
+        # Never adopt a real Adafruit HID node that happens to be plugged in:
+        # these tests exercise the serial path.
+        self.d.ensure_keepalive = lambda: None
+        self.pump = None
 
     def tearDown(self):
+        if self.pump is not None:
+            self.pump.halt()
+        try:
+            self.d.stop_stream()
+        except Exception:
+            pass
         os.chdir(self._cwd)
         shutil.rmtree(self.sandbox, ignore_errors=True)
 
@@ -207,6 +273,73 @@ class ProtocolIntegration(unittest.TestCase):
         resp = self.d.set_config(cfg)
         self.assertTrue(resp.get("rebooting"))
         self.assertEqual(json.loads(Path("config.json").read_text())["device"]["name"], "BigCfg")
+
+    # ------------------------------------------------------------ streaming
+
+    def _stream(self, interval_ms=20):
+        """Start a background firmware pump and a device stream; returns a
+        thread-safe frame list."""
+        frames = []
+        lock = threading.Lock()
+
+        def cb(frame):
+            with lock:
+                frames.append(frame)
+
+        self.pump = Pump(self.port)
+        self.pump.start()
+        self.d.start_stream(cb, interval_ms=interval_ms)
+        return frames, lock
+
+    @staticmethod
+    def _wait(frames, lock, count, timeout=3.0):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            with lock:
+                if len(frames) >= count:
+                    return list(frames)
+            time.sleep(0.005)
+        with lock:
+            raise AssertionError("only %d frames after %.1fs: %r"
+                                 % (len(frames), timeout, frames))
+
+    def test_stream_snapshot_then_delta_then_commands_resume(self):
+        self.box.pin_cache = {"D1": False, "D2": False, "D3": False, "D4": False}
+        frames, lock = self._stream()
+
+        first = self._wait(frames, lock, 1)[0]
+        self.assertEqual(first["src"], "serial")
+        self.assertTrue(first["snapshot"], "first frame must be a full pin snapshot")
+        self.assertEqual(first["p"], {"D1": False, "D2": False, "D3": False, "D4": False})
+
+        with self.wire_lock:
+            self.box.pin_cache["D3"] = True
+        delta = self._wait(frames, lock, 2)[1]
+        self.assertFalse(delta.get("snapshot"))
+        self.assertEqual(delta["p"], {"D3": True})  # changes only
+
+        self.d.stop_stream()
+        self.assertFalse(self.h._streaming)
+        # The reader released the port cleanly: ordinary commands work again.
+        self.assertEqual(self.d.get_config()["device"]["name"], "ProtoBox")
+
+    def test_restarting_the_stream_is_harmless(self):
+        self.box.pin_cache = {"D1": False, "D2": True}
+        frames, lock = self._stream()
+        self._wait(frames, lock, 1)
+
+        # Re-issuing stream_start mid-stream (what the monitor's watchdog does
+        # to revive a stream the firmware dropped) must not desync anything.
+        self.d.rearm_stream()
+        after = self._wait(frames, lock, 2)
+        self.assertTrue(after[1]["snapshot"], "a re-arm must re-send a full snapshot")
+        self.assertEqual(after[1]["p"], {"D1": False, "D2": True})
+
+        # And a full restart on top of a running stream.
+        self.d.start_stream(lambda f: None, interval_ms=20)
+        self.assertTrue(self.h._streaming)
+        self.d.stop_stream()
+        self.assertEqual(self.d.get_config()["device"]["name"], "ProtoBox")
 
     def test_bad_config_rejected(self):
         with self.assertRaises(DeviceError) as ctx:

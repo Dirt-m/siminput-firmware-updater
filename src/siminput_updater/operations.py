@@ -30,14 +30,9 @@ class OperationContext:
             raise OperationCancelled()
 
     def _post(self, fn) -> None:
-        # The window can be destroyed while a worker is still running; posting
-        # to a dead Tk raises RuntimeError from the worker thread.
-        if getattr(self._app, "_closing", False):
-            return
-        try:
-            self._app.after(0, fn)
-        except RuntimeError:
-            pass
+        # App.post, not after(0, ...): a timer created from a worker thread
+        # does not reliably run on a threaded Tcl. See App.post.
+        self._app.post(fn)
 
     def status(self, message: str) -> None:
         self._post(lambda: self._app.overlay.set_status(message))
