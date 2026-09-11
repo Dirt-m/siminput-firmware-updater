@@ -123,6 +123,8 @@ class RuleCard(tk.Frame):
         self.editor = editor
         self.rule = rule
         self._widgets: dict[str, object] = {}
+        self._errors: dict[str, str] = {}
+        self._err_label: tk.Label | None = None
         self._plain: list[tk.Widget] = []     # plain-tk children to retheme
         self._ctk_children: list = []          # CTk children needing bg_color sync
         self._rows: list[tk.Frame] = []
@@ -244,6 +246,7 @@ class RuleCard(tk.Frame):
             self._field(r, "Axis", lambda p: self._axis(p))
             self._field(r, "Step", lambda p: self._num(p, "step", self.rule.step))
         self._sync_summary()
+        self._apply_errors()
 
     def _row(self, gap: int = 6) -> tk.Frame:
         row = tk.Frame(self.fields, bg=self._bg)
@@ -412,6 +415,68 @@ class RuleCard(tk.Frame):
                 except (ValueError, AttributeError):
                     pass
 
+    # ---------------------------------------------------------- validation
+
+    def set_errors(self, errors: dict[str, str]):
+        """`errors` maps a validator field ("input", "inputs[1]", "cw", …) to
+        its message. Outlines the offending widgets and shows the messages
+        under the fields; an empty dict clears everything."""
+        self._errors = dict(errors)
+        self._apply_errors()
+
+    def _widget_for(self, field: str):
+        """Validator field → the widget that edits it (None if not shown)."""
+        w = self._widgets
+        if field.startswith("inputs"):
+            if self.rule.type == "ENCODER":
+                if field == "inputs":
+                    return [w.get("pin_a"), w.get("pin_b")]
+                return w.get("pin_b") if field.endswith("[1]") else w.get("pin_a")
+            return w.get("inputs")
+        if field == "type":
+            return self.type_picker
+        return w.get(field)
+
+    def _apply_errors(self):
+        bad: set[int] = set()
+        for field in self._errors:
+            target = self._widget_for(field)
+            for widget in (target if isinstance(target, list) else [target]):
+                if widget is not None:
+                    bad.add(id(widget))
+        candidates = list(self._widgets.values()) + ([self.type_picker] if self.type_picker else [])
+        for widget in candidates:
+            if widget is None:
+                continue
+            is_bad = id(widget) in bad
+            if isinstance(widget, ctk.CTkEntry):
+                widget.configure(border_color=t.ERROR if is_bad else t.BORDER)
+            elif isinstance(widget, Picker):
+                widget.configure(highlightthickness=1 if is_bad else 0,
+                                 highlightbackground=t.resolve(t.ERROR))
+        messages = list(dict.fromkeys(self._errors.values()))
+        if messages:
+            if self._err_label is None or not self._err_label.winfo_exists():
+                self._err_label = tk.Label(self.body, anchor="w", justify="left", bg=self._bg,
+                                           fg=t.resolve(t.ERROR), font=self._cap_font)
+            self._err_label.configure(text="  ·  ".join(messages), bg=self._bg, fg=t.resolve(t.ERROR))
+            self._err_label.grid(row=1, column=0, columnspan=2, sticky="w", pady=(4, 0))
+        elif self._err_label is not None and self._err_label.winfo_exists():
+            self._err_label.grid_remove()
+
+    def focus_field(self, field: str):
+        target = self._widget_for(field)
+        if isinstance(target, list):
+            target = target[0]
+        if target is None:
+            self.focus_first()
+            return
+        try:
+            target.focus_set()
+            target.select_range(0, "end")
+        except Exception:
+            pass
+
     def focus_first(self):
         for key in ("input", "inputs", "pin_a"):
             e = self._widgets.get(key)
@@ -508,6 +573,7 @@ class RuleEditor(ctk.CTkFrame):
 
         self._model = RuleList()
         self._cards: list[RuleCard] = []
+        self._errors: dict[int, dict[str, str]] = {}
         self._build_pending: list[Rule] = []
         self._build_after: str | None = None
 
@@ -553,6 +619,7 @@ class RuleEditor(ctk.CTkFrame):
         for card in self._cards:
             card.destroy()
         self._cards.clear()
+        self._errors = {}
         self._model = RuleList(rules)
         self._build_pending = list(self._model.rules)
         self._build_some(SYNC_BUILD_COUNT)
@@ -577,12 +644,35 @@ class RuleEditor(ctk.CTkFrame):
     def index_of(self, card: RuleCard) -> int:
         return self._cards.index(card)
 
+    def set_errors(self, errors: dict[int, dict[str, str]]):
+        """Per-rule validation errors, keyed by rule index (the validator's
+        rules[i] — comments keep their slot, so indices match cards 1:1)."""
+        self._errors = errors
+        for i, card in enumerate(self._cards):
+            card.set_errors(errors.get(i, {}))
+
+    def reveal(self, index: int, field: str | None = None):
+        """Scroll a rule into view and focus the field a validator path names."""
+        self._flush_build()
+        if not (0 <= index < len(self._cards)):
+            return
+        card = self._cards[index]
+        self._scroll_to(card)
+        if field:
+            card.focus_field(field)
+        else:
+            card.focus_first()
+
     # ----------------------------------------------------- incremental build
 
     def _build_some(self, n: int):
         while self._build_pending and n > 0:
             rule = self._build_pending.pop(0)
-            self._place_card(RuleCard(self.scroll, self, rule), len(self._cards))
+            card = RuleCard(self.scroll, self, rule)
+            self._place_card(card, len(self._cards))
+            errs = self._errors.get(len(self._cards) - 1)
+            if errs:
+                card.set_errors(errs)
             n -= 1
         self._sync_empty()
 

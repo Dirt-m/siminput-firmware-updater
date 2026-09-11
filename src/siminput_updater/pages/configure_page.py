@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from pathlib import Path
 from tkinter import filedialog
 from typing import TYPE_CHECKING
@@ -13,6 +14,7 @@ from ..config_model import (
     BoolVar,
     Config,
     DeviceSettings,
+    ValidationError,
     validate,
 )
 from ..widgets.rule_editor import RuleEditor
@@ -51,6 +53,44 @@ def _option(master, values, command=None, width=160):
     )
 
 
+VALIDATE_DELAY_MS = 250   # debounce after the last keystroke
+MAX_PROBLEM_ROWS = 8
+
+_PATH_RE = re.compile(r"^(\w+)(?:\[(\d+)\])?(?:\.(.+))?$")
+
+RULE_FIELD_LABELS = {
+    "input": "Input", "inputs": "Inputs", "output": "Output", "cw": "CW", "ccw": "CCW",
+    "axis": "Axis", "pulse_ms": "Pulse", "delay_ms": "Delay", "step": "Step",
+    "divisor": "Steps/detent", "type": "Type",
+}
+
+
+def parse_path(path: str) -> tuple[str, int | None, str | None]:
+    """"rules[3].inputs[1]" → ("rules", 3, "inputs[1]"); "device.pid" →
+    ("device", None, "pid"); "config" → ("config", None, None)."""
+    m = _PATH_RE.match(path)
+    if not m:
+        return path, None, None
+    section, idx, field = m.groups()
+    return section, (int(idx) if idx is not None else None), field
+
+
+def describe_problem(err: ValidationError) -> tuple[str, str]:
+    """(where, what) for the problems panel, numbered from 1 like the cards."""
+    section, idx, field = parse_path(err.path)
+    if section == "rules" and idx is not None:
+        base = field.split("[")[0] if field else ""
+        label = RULE_FIELD_LABELS.get(base, base)
+        return (f"Rule {idx + 1}" + (f" · {label}" if label else ""), err.message)
+    if section == "bools" and idx is not None:
+        return (f"Variable {idx + 1}", err.message)
+    if section == "axes" and idx is not None:
+        return (f"Axis {idx + 1}", err.message)
+    if section == "device":
+        return ("Device", err.message)
+    return ("Config", err.message)
+
+
 def _slider(master, **kw):
     opts = dict(progress_color=t.ACCENT, button_color=t.ACCENT, button_hover_color=t.ACCENT_HOVER,
                 fg_color=t.SURFACE_3)
@@ -72,9 +112,12 @@ class ConfigurePage(ctk.CTkFrame):
         self._device_extra: dict = {}
 
         self.grid_columnconfigure(0, weight=1)
-        self.grid_rowconfigure(2, weight=1)
+        self.grid_rowconfigure(3, weight=1)
+        self._validate_after: str | None = None
+        self._problems: list[ValidationError] = []
 
         self._create_toolbar()
+        self._create_problems_panel()
         self._create_tabs()
 
         self.app.register_connection_listener(lambda c: self._refresh_connection_state())
@@ -108,7 +151,7 @@ class ConfigurePage(ctk.CTkFrame):
 
         # Tab strip — a flush row of buttons sitting directly above the content.
         strip = ctk.CTkFrame(self, fg_color="transparent")
-        strip.grid(row=1, column=0, sticky="ew", pady=(12, 0))
+        strip.grid(row=2, column=0, sticky="ew", pady=(12, 0))
         self._tab_buttons: dict[str, ctk.CTkButton] = {}
         for i, name in enumerate(self._tab_names):
             btn = ctk.CTkButton(
@@ -122,7 +165,7 @@ class ConfigurePage(ctk.CTkFrame):
 
         # Content area — one frame per tab, swapped via grid/grid_remove.
         self._tab_host = ctk.CTkFrame(self, fg_color=t.SURFACE, corner_radius=t.RADIUS)
-        self._tab_host.grid(row=2, column=0, sticky="nsew")
+        self._tab_host.grid(row=3, column=0, sticky="nsew")
         self._tab_host.grid_columnconfigure(0, weight=1)
         self._tab_host.grid_rowconfigure(0, weight=1)
 
@@ -159,6 +202,102 @@ class ConfigurePage(ctk.CTkFrame):
             # Axes may have been added or renamed since the rule cards were
             # built — refresh the AXIS_* dropdowns so they can be selected.
             self.rule_editor.refresh_axis_menus()
+
+    # -------------------------------------------------------- problems panel
+
+    def _create_problems_panel(self):
+        self._problems_panel = ctk.CTkFrame(
+            self, fg_color=t.ERROR_SOFT, corner_radius=t.RADIUS, border_width=1, border_color=t.ERROR)
+        self._problems_panel.grid(row=1, column=0, sticky="ew", pady=(12, 0))
+        self._problems_panel.grid_columnconfigure(0, weight=1)
+        self._problems_panel.grid_remove()
+        self._problems_title = ctk.CTkLabel(
+            self._problems_panel, text="", anchor="w", font=t.font(12, "bold"), text_color=t.ERROR)
+        self._problems_title.grid(row=0, column=0, padx=14, pady=(8, 3), sticky="w")
+        self._problem_rows: list[ctk.CTkLabel] = []
+
+    def _show_problems(self, errors: list[ValidationError]):
+        self._problems = list(errors)
+        for row in self._problem_rows:
+            row.destroy()
+        self._problem_rows = []
+        if not errors:
+            self._problems_panel.grid_remove()
+            return
+        n = len(errors)
+        self._problems_title.configure(text=f"{n} problem{'s' if n != 1 else ''} to fix before saving")
+        for i, err in enumerate(errors[:MAX_PROBLEM_ROWS]):
+            where, what = describe_problem(err)
+            row = ctk.CTkLabel(
+                self._problems_panel, text=f"{where}:  {what}", anchor="w", cursor="hand2",
+                font=t.font(12), text_color=t.TEXT, height=18)
+            row.grid(row=i + 1, column=0, padx=14, pady=(0, 8 if i == n - 1 else 1), sticky="w")
+            row.bind("<Button-1>", lambda _e, e=err: self._goto_problem(e))
+            self._problem_rows.append(row)
+        if n > MAX_PROBLEM_ROWS:
+            more = ctk.CTkLabel(self._problems_panel, text=f"+{n - MAX_PROBLEM_ROWS} more", anchor="w",
+                                font=t.font(12), text_color=t.TEXT_DIM, height=18)
+            more.grid(row=MAX_PROBLEM_ROWS + 1, column=0, padx=14, pady=(0, 8), sticky="w")
+            self._problem_rows.append(more)
+        self._problems_panel.grid()
+
+    def _goto_problem(self, err: ValidationError):
+        section, idx, field = parse_path(err.path)
+        if section == "rules":
+            self._show_tab("Rules")
+            if idx is not None:
+                self.rule_editor.reveal(idx, field)
+        elif section == "bools":
+            self._show_tab("Variables")
+            if idx is not None and idx < len(self._var_widgets):
+                self._var_widgets[idx]["name"].focus_set()
+        elif section == "axes":
+            self._show_tab("Axes")
+            if idx is not None and idx < len(self._axis_widgets):
+                self._axis_widgets[idx]["name"].focus_set()
+        elif section == "device":
+            self._show_tab("Device")
+            (self.pid_entry if field == "pid" else self.name_entry).focus_set()
+
+    # ------------------------------------------------------- live validation
+
+    def _schedule_validate(self):
+        if self._validate_after is not None:
+            self.after_cancel(self._validate_after)
+        self._validate_after = self.after(VALIDATE_DELAY_MS, self._validate_now)
+
+    def _validate_now(self) -> list[ValidationError]:
+        """Validate the whole editor state, outline the offending fields and
+        refresh the problems panel. Returns the errors (empty when clean)."""
+        if self._validate_after is not None:
+            try:
+                self.after_cancel(self._validate_after)
+            except Exception:
+                pass
+            self._validate_after = None
+        errors = [ValidationError(path, msg) for path, msg in self._input_errors()]
+        if not errors:
+            config = self._collect_config()
+            errors = validate(config, board_map=self.app.board_map, pins=self.app.device_pins)
+
+        rule_errors: dict[int, dict[str, str]] = {}
+        bad_vars: set[int] = set()
+        bad_axes: set[int] = set()
+        for err in errors:
+            section, idx, field = parse_path(err.path)
+            if section == "rules" and idx is not None:
+                rule_errors.setdefault(idx, {})[field or "type"] = err.message
+            elif section == "bools" and idx is not None:
+                bad_vars.add(idx)
+            elif section == "axes" and idx is not None and field == "id":
+                bad_axes.add(idx)
+        self.rule_editor.set_errors(rule_errors)
+        for i, w in enumerate(self._var_widgets):
+            w["name"].configure(border_color=t.ERROR if i in bad_vars else t.BORDER)
+        for i, w in enumerate(self._axis_widgets):
+            w["name"].configure(border_color=t.ERROR if i in bad_axes else t.BORDER)
+        self._show_problems(errors)
+        return errors
 
     # -- Device tab --
 
@@ -397,23 +536,25 @@ class ConfigurePage(ctk.CTkFrame):
 
     # ----------------------------------------------------- config sync
 
-    def _input_errors(self) -> list[str]:
-        """Malformed free-text fields. Reported instead of being silently
-        replaced with defaults — a typo'd PID must not save as 0xF000."""
+    def _input_errors(self) -> list[tuple[str, str]]:
+        """Malformed free-text fields, as (path, message). Reported instead of
+        being silently replaced with defaults — a typo'd PID must not save
+        as 0xF000."""
         errors = []
         pid_text = self.pid_entry.get().strip()
         if pid_text:
             try:
                 int(pid_text, 16)
             except ValueError:
-                errors.append(f"USB Product ID '{pid_text}' is not valid hex")
+                errors.append(("device.pid", f"USB Product ID '{pid_text}' is not valid hex"))
         if not self.refresh_disable.get():
             refresh_text = self.refresh_entry.get().strip()
             if refresh_text:
                 try:
                     float(refresh_text)
                 except ValueError:
-                    errors.append(f"Keep-alive interval '{refresh_text}' is not a number")
+                    errors.append(("device.inactivity_refresh",
+                                   f"Keep-alive interval '{refresh_text}' is not a number"))
         return errors
 
     def _collect_config(self) -> Config:
@@ -503,11 +644,13 @@ class ConfigurePage(ctk.CTkFrame):
 
         self.rule_editor.load_rules(config.rules)
         self._clear_dirty()
+        self._validate_now()
 
     def _mark_dirty(self, *_args):
         if not self._dirty:
             self._dirty = True
             self.dirty_label.configure(text="Unsaved changes")
+        self._schedule_validate()
 
     def _clear_dirty(self):
         self._dirty = False
@@ -559,18 +702,14 @@ class ConfigurePage(ctk.CTkFrame):
         self.app.run_operation("Reading configuration", work, on_success=on_success, success_message="Loaded")
 
     def _save_config(self):
-        input_errors = self._input_errors()
-        if input_errors:
-            self.app.show_status("; ".join(input_errors), "error", 8000)
+        errors = self._validate_now()
+        if errors:
+            n = len(errors)
+            self.app.show_status(
+                f"Fix the {n} problem{'s' if n != 1 else ''} listed above before saving", "error", 6000)
+            self._goto_problem(errors[0])
             return
         config = self._collect_config()
-        errors = validate(config, board_map=self.app.board_map, pins=self.app.device_pins)
-        if errors:
-            msg = "; ".join(str(e) for e in errors[:3])
-            if len(errors) > 3:
-                msg += f" (+{len(errors) - 3} more)"
-            self.app.show_status(f"Validation errors: {msg}", "error", 8000)
-            return
         if not self.app.device.connected:
             self.app.show_status("No device connected", "error")
             return
