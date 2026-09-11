@@ -10,11 +10,11 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 from siminput_updater.monitor import (  # noqa: E402
-    REARM_GAP_S, SILENCE_S, StateMerger, should_rearm,
+    REARM_GAP_S, SILENCE_S, LiveMonitor, StateMerger, should_rearm,
 )
 
 
-def serial(b=None, a=None, p=None, snapshot=False):
+def serial(b=None, a=None, p=None, an=None, snapshot=False):
     frame = {"src": "serial"}
     if b is not None:
         frame["b"] = b
@@ -22,6 +22,8 @@ def serial(b=None, a=None, p=None, snapshot=False):
         frame["a"] = a
     if p is not None:
         frame["p"] = p
+    if an is not None:
+        frame["an"] = an
     if snapshot:
         frame["snapshot"] = True
     return frame
@@ -113,6 +115,38 @@ class PinDeltasAndSnapshots(unittest.TestCase):
         self.assertEqual(self.m.buttons, {1})
 
 
+class AnalogSamples(unittest.TestCase):
+    """Firmware 2.7 "an": raw ADC samples, ints, merged not replaced."""
+
+    def setUp(self):
+        self.m = StateMerger(evdev_active=True)
+
+    def test_samples_stay_ints(self):
+        state = self.m.feed(serial(an={"A1": 1, "A2": 0}, snapshot=True))
+        self.assertEqual(state["an"], {"A1": 1, "A2": 0})
+        self.assertIs(type(state["an"]["A1"]), int)
+        self.assertIsNot(state["an"]["A1"], True)
+
+    def test_partial_frames_merge(self):
+        self.m.feed(serial(an={"A1": 100, "A2": 200}, snapshot=True))
+        state = self.m.feed(serial(an={"A1": 150}))
+        self.assertEqual(state["an"], {"A1": 150, "A2": 200})
+
+    def test_frames_without_an_keep_the_last_samples(self):
+        self.m.feed(serial(an={"A1": 100}, snapshot=True))
+        self.assertEqual(self.m.feed(serial(p={"D1": True}))["an"], {"A1": 100})
+        self.assertEqual(self.m.feed(evdev(b=[1]))["an"], {"A1": 100})
+
+    def test_garbage_values_are_ignored(self):
+        state = self.m.feed(serial(an={"A1": True, "A2": "x", "A3": 7.0}))
+        self.assertEqual(state["an"], {"A3": 7})
+
+    def test_state_copies_the_map(self):
+        state = self.m.feed(serial(an={"A1": 5}))
+        state["an"]["A1"] = 9
+        self.assertEqual(self.m.analog["A1"], 5)
+
+
 class Watchdog(unittest.TestCase):
     def test_quiet_stream_is_rearmed(self):
         self.assertTrue(should_rearm(now=100.0, last_frame=100.0 - SILENCE_S,
@@ -128,6 +162,66 @@ class Watchdog(unittest.TestCase):
                                       last_rearm=now - REARM_GAP_S / 2))
         self.assertTrue(should_rearm(now, last_frame=0.0,
                                      last_rearm=now - REARM_GAP_S))
+
+
+class _InstantDevice:
+    """A device whose stream delivers its snapshot frame before start_stream
+    even returns — the mock does exactly this, and hardware can be close."""
+    connected = True
+    stream_uses_evdev = False
+
+    def __init__(self):
+        self.started = 0
+
+    def start_stream(self, callback, interval_ms=50, on_end=None):
+        self.started += 1
+        callback({"src": "serial", "b": [], "a": [32767] * 8, "p": {"D1": True},
+                  "an": {"A1": 1234}, "snapshot": True})
+
+    def stop_stream(self):
+        pass
+
+    def rearm_stream(self):
+        pass
+
+
+class _FakeApp:
+    """Just enough of App for LiveMonitor: listeners, a synchronous post,
+    and after() that never fires."""
+
+    def __init__(self, device):
+        self.device = device
+        self._closing = False
+        self.listeners = []
+
+    def register_connection_listener(self, fn):
+        self.listeners.append(fn)
+
+    def post(self, fn):
+        fn()
+
+    def after(self, _ms, _fn):
+        return "never"
+
+    def after_cancel(self, _id):
+        pass
+
+    def show_status(self, *a, **k):
+        pass
+
+
+class StartKeepsTheFirstFrame(unittest.TestCase):
+    def test_snapshot_delivered_during_start_is_not_lost(self):
+        device = _InstantDevice()
+        app = _FakeApp(device)
+        mon = LiveMonitor(app)
+        seen = []
+        mon.subscribe(seen.append)
+        mon.acquire()
+        self.assertEqual(device.started, 1)
+        self.assertTrue(mon.active)
+        self.assertEqual(seen[-1]["p"], {"D1": True})
+        self.assertEqual(seen[-1]["an"], {"A1": 1234})
 
 
 if __name__ == "__main__":

@@ -74,6 +74,11 @@ class StateMerger:
 
     Pins claimed by ENCODER rules are deinit'd by the firmware and read False
     forever; that is the device's behaviour, not a merge artefact.
+
+    Serial "an" (firmware 2.7+) carries the raw 16-bit sample of every claimed
+    analog pin, present only when one moved past the ADC noise floor or in
+    the first frame. Absent means unchanged, so it merges into the kept map
+    and values stay ints — a raw sample of 1 is not "pressed".
     """
 
     def __init__(self, evdev_active: bool = False):
@@ -81,6 +86,7 @@ class StateMerger:
         self.buttons: set[int] = set()
         self.axes: list[int] = [32767] * 8
         self.pins: dict[str, bool] = {}
+        self.analog: dict[str, int] = {}
 
     def feed(self, frame: dict) -> State:
         src = frame.get("src", "serial")
@@ -105,6 +111,13 @@ class StateMerger:
                     changed.add(name)
                 self.pins[name] = val
 
+        analog = frame.get("an")
+        if not from_evdev and isinstance(analog, dict):
+            for name, raw in analog.items():
+                if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+                    continue
+                self.analog[str(name)] = int(raw)
+
         return self.state(changed=changed, snapshot=snapshot)
 
     def state(self, changed: set[str] | None = None, snapshot: bool = False) -> State:
@@ -112,6 +125,7 @@ class StateMerger:
             "b": set(self.buttons),
             "a": list(self.axes),
             "p": dict(self.pins),
+            "an": dict(self.analog),
             "changed": set(changed or ()),
             "snapshot": snapshot,
         }
@@ -196,26 +210,33 @@ class LiveMonitor:
 
     def _start(self) -> None:
         self._cancel_retry()
+        # Fresh state *before* the stream starts: the first frame (the pin
+        # snapshot) can arrive on the reader thread before start_stream even
+        # returns, and it must land in the merger that is kept, not in one
+        # about to be replaced. Whether evdev is the button/axis source is
+        # only known once the stream is up, so that flag is set afterwards.
+        with self._lock:
+            self._merger = StateMerger()
+            self._pending = None
+            self._pending_changed = set()
+            self._delivery_scheduled = False
+        now = time.monotonic()
+        self._last_frame = now
+        self._last_rearm = now
+        self._active = True
         try:
             self.app.device.start_stream(
                 self._on_frame, interval_ms=STREAM_INTERVAL_MS,
                 on_end=self._on_stream_died,
             )
         except Exception as e:
+            self._active = False
             log.warning("live monitor failed to start: %s", e)
             self.app.show_status(f"Live monitor unavailable: {e}", "error")
             self._schedule_retry()
             return
         with self._lock:
-            self._merger = StateMerger(
-                evdev_active=bool(getattr(self.app.device, "stream_uses_evdev", False)))
-            self._pending = None
-            self._pending_changed = set()
-            self._delivery_scheduled = False
-        self._active = True
-        now = time.monotonic()
-        self._last_frame = now
-        self._last_rearm = now
+            self._merger.evdev_active = bool(getattr(self.app.device, "stream_uses_evdev", False))
         self._schedule_watchdog()
 
     def _stop(self) -> None:

@@ -49,6 +49,11 @@ if HAVE_FW:
     sys.path.insert(0, str(FW_REPO / "lib"))
     import serial_handler  # noqa: E402
 
+# Analog inputs arrived in firmware 2.7.0 (commit b52cd8e); an older checkout
+# still runs the digital suite and skips the analog cases.
+HAVE_ANALOG_FW = HAVE_FW and hasattr(serial_handler, "analog_pins_used")
+
+from siminput_updater.config_model import Config, validate  # noqa: E402
 from siminput_updater.device import Device, DeviceError  # noqa: E402
 
 
@@ -56,8 +61,13 @@ class FakeBox:
     def __init__(self):
         self.config = {"device": {"name": "ProtoBox", "pid": 0xF001},
                        "bools": [], "axes": [], "rules": []}
-        self.pin_names = frozenset({"D1", "D2", "D3", "D4"})
+        self.pin_names = frozenset({"D1", "D2", "D3", "D4", "A1", "A2"})
         self.board_map = {"name": "rev2"}
+        # Firmware 2.7 analog surface: ADC-capable pins, the AnalogIn objects
+        # a config has claimed, and their latest raw samples.
+        self.analog_pin_names = frozenset({"A1", "A2"})
+        self.analog_ins = {}
+        self.analog_raw = {}
         self.rules = []
         self.b_states = {}
         self.axis_states = {}
@@ -345,6 +355,71 @@ class ProtocolIntegration(unittest.TestCase):
         with self.assertRaises(DeviceError) as ctx:
             self.d.set_config({"device": {"pid": 0x80F4}})
         self.assertIn("0x80F4", str(ctx.exception))
+
+    # ---------------------------------------------------------- analog (2.7)
+
+    def _needs_analog(self):
+        if not HAVE_ANALOG_FW:
+            self.skipTest("firmware checkout predates analog support (b52cd8e)")
+
+    def test_get_info_and_get_state_report_analog(self):
+        self._needs_analog()
+        info = self.d.get_info()
+        self.assertTrue(info.has_analog)
+        self.assertEqual(info.analog_pins, ["A1", "A2"])
+        self.assertEqual(info.analog_active, [])
+        self.assertEqual(self.d.get_state()["analog"], {})
+
+        self.box.analog_ins = {"A1": object()}
+        self.box.analog_raw = {"A1": 12000}
+        self.assertEqual(self.d.get_info().analog_active, ["A1"])
+        self.assertEqual(self.d.get_state()["analog"], {"A1": 12000})
+
+    def test_stream_resends_an_only_past_the_noise_floor(self):
+        self._needs_analog()
+        self.box.pin_cache = {"D1": False}
+        self.box.analog_ins = {"A1": object()}
+        self.box.analog_raw = {"A1": 1000}
+        frames, lock = self._stream()
+
+        first = self._wait(frames, lock, 1)[0]
+        self.assertTrue(first["snapshot"])
+        self.assertEqual(first["an"], {"A1": 1000})
+
+        with self.wire_lock:
+            self.box.analog_raw["A1"] = 1010      # ADC jitter: below the 64-count floor
+        time.sleep(0.15)
+        with lock:
+            self.assertEqual(len(frames), 1, "jitter must not produce frames")
+
+        with self.wire_lock:
+            self.box.analog_raw["A1"] = 1100
+        second = self._wait(frames, lock, 2)[1]
+        self.assertEqual(second["an"], {"A1": 1100})
+        self.assertNotIn("p", second, "pins did not change, so no p")
+
+    def test_firmware_validates_analog_rules_like_the_client(self):
+        self._needs_analog()
+        cfg = {
+            "device": {"name": "ProtoBox", "pid": 0xF001},
+            "axes": [{"id": "THR", "output": 2}],
+            "rules": [
+                {"type": "ANALOG", "input": "A1", "axis": "THR", "min": 1000, "max": 60000, "curve": 1.4},
+                {"type": "THRESHOLD", "input": "THR", "output": "B7", "above": 40000, "hysteresis": 500},
+            ],
+        }
+        self.d.validate_config(cfg)   # accepted by the firmware
+        self.assertEqual([str(e) for e in validate(Config.from_dict(cfg), pins=["D1", "A1", "A2"],
+                                                    analog_pins=["A1", "A2"])], [])
+
+        bad = dict(cfg)
+        bad["rules"] = cfg["rules"] + [{"type": "MAP", "input": "A1", "output": "B1"}]
+        with self.assertRaises(DeviceError) as ctx:
+            self.d.validate_config(bad)
+        self.assertIn("A1", str(ctx.exception))
+        client = [str(e) for e in validate(Config.from_dict(bad), pins=["D1", "A1", "A2"],
+                                            analog_pins=["A1", "A2"])]
+        self.assertIn("rules[2].input: 'A1' is claimed as an analog input", client)
 
 
 if __name__ == "__main__":

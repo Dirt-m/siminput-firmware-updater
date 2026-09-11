@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING
 import customtkinter as ctk
 
 from .. import ui_theme as t
+from ..widgets.analog_bar import AnalogBar
 from ..widgets.button_grid import ButtonGrid
 from ..widgets.axis_bar import AxisBar
 
@@ -52,6 +53,8 @@ class DevicePage(ctk.CTkFrame):
         self.button_grid.retheme()
         for bar in self.axis_bars:
             bar.retheme()
+        for bar in self._analog_bars.values():
+            bar.retheme(t.resolve(t.SURFACE))
 
     # --------------------------------------------------------------- info
 
@@ -136,11 +139,26 @@ class DevicePage(ctk.CTkFrame):
             bar.grid(row=i, column=1, pady=4, sticky="ew")
             self.axis_bars.append(bar)
 
+        # Analog inputs (firmware 2.7+): the raw sample of every pin the
+        # config claims, under the axes they usually drive. The whole section
+        # is hidden on firmware without the capability.
+        self._analog_wrap = ctk.CTkFrame(self._mon, fg_color="transparent")
+        self._analog_wrap.grid(row=2, column=1, pady=(14, 2), sticky="new")
+        self._section(self._analog_wrap, "ANALOG INPUTS", 0, 0)
+        self._analog_rows = ctk.CTkFrame(self._analog_wrap, fg_color="transparent")
+        self._analog_rows.grid(row=1, column=0, sticky="w")
+        self._analog_empty = ctk.CTkLabel(
+            self._analog_rows, text="No analog pins claimed. Add an Analog Axis or Analog "
+                                    "Threshold rule and save.",
+            font=t.font(12), text_color=t.TEXT_MUTED, anchor="w")
+        self._analog_empty.grid(row=0, column=0, sticky="w")
+        self._analog_bars: dict[str, AnalogBar] = {}
+        self._analog_wrap.grid_remove()
+
         # Pins are the one thing evdev cannot see; they arrive over the serial
-        # stream on every platform now, so show them plainly until the shared
-        # live panel exists.
+        # stream on every platform now.
         pins_wrap = ctk.CTkFrame(self._mon, fg_color="transparent")
-        pins_wrap.grid(row=2, column=0, columnspan=2, pady=(14, 2), sticky="ew")
+        pins_wrap.grid(row=3, column=0, columnspan=2, pady=(14, 2), sticky="ew")
         pins_wrap.grid_columnconfigure(1, weight=1)
         ctk.CTkLabel(pins_wrap, text="PINS", font=t.font(11, "bold"),
                      text_color=t.TEXT_MUTED, anchor="w").grid(
@@ -177,6 +195,7 @@ class DevicePage(ctk.CTkFrame):
         self._sync_connection_view()
         if not connected:
             self._render_pins({})
+            self._render_analog({})
 
     def _sync_connection_view(self):
         if self.app.device.connected and self.app.device.info:
@@ -185,6 +204,11 @@ class DevicePage(ctk.CTkFrame):
             self._empty.grid_remove()
             self._mon.grid()
             self._fill_stats()
+            full = self.app.full_info
+            if full is not None and getattr(full, "has_analog", False):
+                self._analog_wrap.grid()
+            else:
+                self._analog_wrap.grid_remove()
         else:
             self._stats_row.grid_remove()
             self._info_empty.grid()
@@ -215,6 +239,25 @@ class DevicePage(ctk.CTkFrame):
             if i < len(self.axis_bars):
                 self.axis_bars[i].set_value(val)
         self._render_pins(state.get("p") or {})
+        if getattr(self.app.full_info, "has_analog", False):
+            self._render_analog(state.get("an") or {})
+
+    def _render_analog(self, samples: dict):
+        names = sorted(samples, key=pin_sort_key)
+        if names != list(self._analog_bars):
+            for bar in self._analog_bars.values():
+                bar.destroy()
+            self._analog_bars = {}
+            for i, name in enumerate(names):
+                bar = AnalogBar(self._analog_rows, name, bar_width=170, bg=t.resolve(t.SURFACE))
+                bar.grid(row=i, column=0, sticky="w", pady=3)
+                self._analog_bars[name] = bar
+            if names:
+                self._analog_empty.grid_remove()
+            else:
+                self._analog_empty.grid()
+        for name, bar in self._analog_bars.items():
+            bar.set_value(samples[name])
 
     def _render_pins(self, pins: dict):
         pressed = sorted((name for name, on in pins.items() if on), key=pin_sort_key)

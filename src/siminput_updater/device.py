@@ -66,12 +66,27 @@ class FullDeviceInfo(DeviceInfo):
     caps: tuple = ()
     limits: dict | None = None
     fault: str = ""
+    # Firmware 2.7+: ADC-capable pins, and the ones the running config has
+    # claimed as analog inputs (their raw samples ride in stream frames).
+    analog_pins: list[str] | None = None
+    analog_active: list[str] | None = None
+
+    @property
+    def has_analog(self) -> bool:
+        return "analog" in self.caps
 
 
 ADAFRUIT_VID = 0x239A
 CHUNK_SIZE = 2048  # base64(2048)+envelope ≈ 2756 bytes — must stay under the firmware's 4096-byte line limit
 RESPONSE_TIMEOUT = 3.0
 WRITE_TIMEOUT = 5.0
+
+
+def _str_list(value) -> list[str] | None:
+    """A JSON list of names, or None when the firmware did not send one."""
+    if isinstance(value, list):
+        return [str(v) for v in value]
+    return None
 
 
 def _is_ack(resp: dict) -> bool:
@@ -539,6 +554,8 @@ class Device:
             caps=tuple(resp.get("caps") or ()),
             limits=resp.get("limits"),
             fault=resp.get("fault", ""),
+            analog_pins=_str_list(resp.get("analog_pins")),
+            analog_active=_str_list(resp.get("analog_active")),
         )
 
     def get_config(self) -> dict:
@@ -564,6 +581,8 @@ class Device:
             self._send_chunked("validate_config", data.encode("utf-8"))
 
     def get_state(self) -> dict:
+        """Snapshot of buttons, axes, pins, bools and (firmware 2.7+) the raw
+        sample of every claimed analog pin under "analog"."""
         return self._send({"cmd": "get_state"})
 
     # ------------------------------------------------------------- streaming

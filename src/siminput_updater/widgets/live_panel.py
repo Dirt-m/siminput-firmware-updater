@@ -16,6 +16,7 @@ import customtkinter as ctk
 
 from .. import ui_theme as t
 from ..config_model import _pin_sort_key
+from .analog_bar import AnalogBar
 
 MAX_CHIPS = 24
 
@@ -42,12 +43,19 @@ class LivePanel(ctk.CTkFrame):
         self._body.grid(row=1, column=0, columnspan=3, sticky="ew", padx=12, pady=(0, 10))
         self._body.grid_columnconfigure(1, weight=1)
         self._rows: dict[str, tk.Frame] = {}
-        for i, (key, caption) in enumerate((("p", "Pins"), ("b", "Buttons"))):
-            ctk.CTkLabel(self._body, text=caption, width=58, anchor="w", font=t.font(12),
-                         text_color=t.TEXT_DIM).grid(row=i, column=0, sticky="w", pady=2)
+        self._captions: dict[str, ctk.CTkLabel] = {}
+        for i, (key, caption) in enumerate((("p", "Pins"), ("b", "Buttons"), ("an", "Analog"))):
+            cap = ctk.CTkLabel(self._body, text=caption, width=58, anchor="w", font=t.font(12),
+                               text_color=t.TEXT_DIM)
+            cap.grid(row=i, column=0, sticky="w", pady=2)
             row = tk.Frame(self._body, bg=t.resolve(t.SURFACE))
             row.grid(row=i, column=1, sticky="w", pady=2)
             self._rows[key] = row
+            self._captions[key] = cap
+        # Analog pins (firmware 2.7+) show as raw-value bars, one per claimed
+        # pin; the row only exists while the device reports any.
+        self._analog_bars: dict[str, AnalogBar] = {}
+        self._show_analog_row(False)
         self._sync_toggle()
         self.set_connected(False)
 
@@ -57,6 +65,7 @@ class LivePanel(ctk.CTkFrame):
         self._connected = connected
         if not connected:
             self._last = ((), ())
+            self._set_analog({})
             self._render(("Connect a device to see its pins and buttons here.",), (), muted=True)
             self._status.configure(text="")
         else:
@@ -64,6 +73,7 @@ class LivePanel(ctk.CTkFrame):
             self._render((), ())
 
     def update(self, state: dict):
+        self._set_analog(state.get("an") or {})
         pins = tuple(sorted((p for p, on in (state.get("p") or {}).items() if on), key=_pin_sort_key))
         buttons = tuple(sorted(state.get("b") or ()))
         if (pins, buttons) == self._last:
@@ -71,10 +81,35 @@ class LivePanel(ctk.CTkFrame):
         self._last = (pins, buttons)
         self._render(pins, buttons)
 
+    def _set_analog(self, samples: dict):
+        names = sorted(samples, key=_pin_sort_key)
+        if names != list(self._analog_bars):
+            for bar in self._analog_bars.values():
+                bar.destroy()
+            self._analog_bars = {}
+            row = self._rows["an"]
+            for name in names:
+                bar = AnalogBar(row, name)
+                bar.pack(side="left", padx=(0, 14))
+                self._analog_bars[name] = bar
+            self._show_analog_row(bool(names))
+        for name, bar in self._analog_bars.items():
+            bar.set_value(samples[name])
+
+    def _show_analog_row(self, visible: bool):
+        if visible:
+            self._captions["an"].grid()
+            self._rows["an"].grid()
+        else:
+            self._captions["an"].grid_remove()
+            self._rows["an"].grid_remove()
+
     def retheme(self):
         bg = t.resolve(t.SURFACE)
         for row in self._rows.values():
             row.configure(bg=bg)
+        for bar in self._analog_bars.values():
+            bar.retheme(bg)
         pins, buttons = self._last
         if self._connected:
             self._render(pins, buttons)
@@ -101,6 +136,7 @@ class LivePanel(ctk.CTkFrame):
             return
         if self._collapsed:
             parts = list(pins[:8]) + [f"B{b}" for b in buttons[:8]]
+            parts += [f"{n} {bar._value}" for n, bar in list(self._analog_bars.items())[:4]]
             self._status.configure(text="  ".join(parts) if parts else "nothing pressed")
         else:
             self._status.configure(text="")

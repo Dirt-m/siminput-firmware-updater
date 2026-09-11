@@ -42,7 +42,9 @@ sudo apt install python3-tk        # Ubuntu / Debian
 
 **Edits your config visually.** Device settings, boolean variables, axes, and input rules, all in a tabbed editor with a drag-to-reorder rule builder that flags problems as you type.
 
-**Runs a real rule engine.** Seven rule types cover the common cases: Direct Map, All-Off Detector, Toggle Switch, Timed Pulse, Rotary Encoder, Increase Axis, and Decrease Axis. Rules can read the outputs of earlier rules in the same cycle.
+**Runs a real rule engine.** Nine rule types cover the common cases: Direct Map, All-Off Detector, Toggle Switch, Timed Pulse, Rotary Encoder, Increase Axis, Decrease Axis, Analog Axis, and Analog Threshold. Rules can read the outputs of earlier rules in the same cycle.
+
+**Calibrates analog sensors.** With firmware 2.7 or later, an Analog Axis rule maps a pedal, pot, or hall sensor to an axis. The Calibrate window shows the raw reading live, records the travel as you move the sensor, and captures the rest position with a suggested deadzone. Analog Threshold turns any analog pin or axis into a button.
 
 **Flashes firmware safely.** Upload firmware packages (`.zip`) with chunked transfer, SHA-256 verification, and live progress.
 

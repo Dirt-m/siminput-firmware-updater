@@ -29,6 +29,26 @@ ALL_KNOWN_PINS: list[str] = sorted(
 def pins_for_board(board_map: str) -> list[str]:
     return BOARD_PINS.get(board_map, ALL_KNOWN_PINS)
 
+
+# ADC-capable pins per board (the RP2040's GP26-29). Firmware 2.7+ reports
+# the real list as `analog_pins` in get_info; this table is the offline
+# fallback, so a future board validates correctly once the device is plugged in.
+BOARD_ANALOG_PINS: dict[str, list[str]] = {
+    "rev1": ["A6", "A7", "A8"],
+    "rev2": ["A1", "A2", "A3", "A4"],
+}
+
+ALL_KNOWN_ANALOG_PINS: list[str] = sorted(
+    {p for pins in BOARD_ANALOG_PINS.values() for p in pins}, key=_pin_sort_key)
+
+
+def analog_pins_for_board(board_map: str) -> list[str]:
+    return BOARD_ANALOG_PINS.get(board_map, ALL_KNOWN_ANALOG_PINS)
+
+
+ANALOG_RULE_TYPES = ("ANALOG", "THRESHOLD")
+ANALOG_MAX = 65535
+
 AXIS_SLOT_LABELS = {
     1: "X", 2: "Y", 3: "Z",
     4: "Rx", 5: "Ry", 6: "Rz",
@@ -44,6 +64,8 @@ RULE_TYPE_LABELS = {
     "ENCODER": "Rotary Encoder",
     "AXIS_INC": "Increase Axis",
     "AXIS_DEC": "Decrease Axis",
+    "ANALOG": "Analog Axis",
+    "THRESHOLD": "Analog Threshold",
 }
 
 MAX_CONFIG_BYTES = 32768  # firmware _MAX_CONFIG — larger configs are rejected on save
@@ -188,12 +210,26 @@ class Rule:
     delay_ms: int = 0
     step: int = 1
     divisor: int = 2
+    # ANALOG / THRESHOLD (firmware 2.7+). None means "not set": the firmware
+    # default applies and the key stays out of to_dict().
+    min: int | None = None
+    max: int | None = None
+    center: int | None = None
+    deadzone: int | None = None
+    filter: int | None = None
+    hysteresis: int | None = None
+    curve: float | int | list | None = None
+    above: int | None = None
+    below: int | None = None
     comment: bool = False   # a type-less entry the firmware skips — kept verbatim
     raw: dict = field(default_factory=dict)
     extra: dict = field(default_factory=dict)
 
     _KNOWN = {"type", "input", "inputs", "output", "cw", "ccw", "axis",
-              "invert", "pulse_ms", "delay_ms", "step", "divisor"}
+              "invert", "pulse_ms", "delay_ms", "step", "divisor",
+              "min", "max", "center", "deadzone", "filter", "hysteresis",
+              "curve", "above", "below"}
+    _ANALOG_OPTIONAL = ("min", "max", "center", "deadzone", "filter", "hysteresis", "curve")
 
     def to_dict(self) -> dict:
         if self.comment:
@@ -240,6 +276,26 @@ class Rule:
             d["axis"] = self.axis
             if self.step != 1:
                 d["step"] = self.step
+        elif self.type == "ANALOG":
+            d["input"] = self.input
+            d["axis"] = self.axis
+            for key in self._ANALOG_OPTIONAL:
+                val = getattr(self, key)
+                if val is not None:
+                    d[key] = list(val) if isinstance(val, list) else val
+            if self.invert:
+                d["invert"] = True
+        elif self.type == "THRESHOLD":
+            d["input"] = self.input
+            d["output"] = self.output
+            if self.above is not None:
+                d["above"] = self.above
+            if self.below is not None:
+                d["below"] = self.below
+            if self.hysteresis is not None:
+                d["hysteresis"] = self.hysteresis
+            if self.invert:
+                d["invert"] = True
         return d
 
     @classmethod
@@ -262,17 +318,28 @@ class Rule:
             delay_ms=d.get("delay_ms", 0),
             step=d.get("step", 1),
             divisor=d.get("divisor", 2),
+            min=d.get("min"), max=d.get("max"), center=d.get("center"),
+            deadzone=d.get("deadzone"), filter=d.get("filter"),
+            hysteresis=d.get("hysteresis"), curve=d.get("curve"),
+            above=d.get("above"), below=d.get("below"),
             extra=_split_extra(d, cls._KNOWN),
         )
 
     def copy(self) -> Rule:
         c = Rule(**{f: getattr(self, f) for f in (
             "type", "input", "output", "cw", "ccw", "axis", "invert",
-            "pulse_ms", "delay_ms", "step", "divisor", "comment")})
+            "pulse_ms", "delay_ms", "step", "divisor", "comment",
+            "min", "max", "center", "deadzone", "filter", "hysteresis",
+            "above", "below")})
         c.inputs = list(self.inputs)
+        c.curve = list(self.curve) if isinstance(self.curve, list) else self.curve
         c.raw = dict(self.raw)
         c.extra = dict(self.extra)
         return c
+
+    @property
+    def is_analog(self) -> bool:
+        return not self.comment and self.type in ANALOG_RULE_TYPES
 
     def summary(self) -> str:
         if self.comment:
@@ -304,6 +371,19 @@ class Rule:
             return f"{self.input} increases {self.axis} by {self.step}"
         if t == "AXIS_DEC":
             return f"{self.input} decreases {self.axis} by {self.step}"
+        if t == "ANALOG":
+            lo = 0 if self.min is None else self.min
+            hi = ANALOG_MAX if self.max is None else self.max
+            rng = f"{lo}–{hi}" if self.center is None else f"{lo}–{self.center}–{hi}"
+            return f"{self.input or '?'} drives {self.axis or '?'} over {rng}{inv}"
+        if t == "THRESHOLD":
+            if self.above is not None:
+                cond = f"above {self.above}"
+            elif self.below is not None:
+                cond = f"below {self.below}"
+            else:
+                cond = "?"
+            return f"{_fmt_output(self.output)} when {self.input or '?'} is {cond}{inv}"
         return f"{t}: ?"
 
 
@@ -352,16 +432,51 @@ class Config:
     def get_axis_choices(self) -> list[str]:
         return [a.id for a in self.axes if a.id]
 
+    def uses_analog(self) -> bool:
+        """True when any rule needs firmware 2.7+ analog support."""
+        return any(r.is_analog for r in self.rules)
+
 
 _B_PATTERN = re.compile(r"^B(\d+)$")
 
 
+def _is_int(v) -> bool:
+    return isinstance(v, int) and not isinstance(v, bool)
+
+
+def _in_range(v) -> bool:
+    return _is_int(v) and 0 <= v <= ANALOG_MAX
+
+
+def _curve_error(curve) -> str | None:
+    """Mirror the firmware's curve rules; None when the value is acceptable."""
+    if isinstance(curve, list):
+        if len(curve) < 2 or len(curve) > 32:
+            return "curve table needs 2-32 points"
+        last_x = -1
+        for p in curve:
+            if (not isinstance(p, list) or len(p) != 2
+                    or not _in_range(p[0]) or not _in_range(p[1])):
+                return "curve points must be [in, out] integer pairs 0-65535"
+            if p[0] <= last_x:
+                return "curve point inputs must be strictly increasing"
+            last_x = p[0]
+        return None
+    if isinstance(curve, (int, float)) and not isinstance(curve, bool):
+        if curve <= 0 or curve > 10:
+            return "curve exponent must be > 0 and <= 10"
+        return None
+    return "curve must be a number or a list of [in, out] points"
+
+
 def validate(config: Config, board_map: str = "",
-             pins: list[str] | None = None) -> list[ValidationError]:
+             pins: list[str] | None = None,
+             analog_pins: list[str] | None = None) -> list[ValidationError]:
     """Client-side validation, kept in lockstep with the firmware's
     validate_config. `pins` is the device-reported pin list (protocol 2);
     without it, the hardcoded per-revision table is used, falling back to the
-    union of all known boards."""
+    union of all known boards. `analog_pins` is the device-reported ADC pin
+    list (firmware 2.7+); without it the per-board table applies."""
     errors: list[ValidationError] = []
 
     # Device settings
@@ -444,9 +559,41 @@ def validate(config: Config, board_map: str = "",
     valid_outputs = bool_ids | {f"B{i}" for i in range(1, 128)} | {"REFRESH"}
     encoder_pins: set[str] = set()
 
+    # Analog: pins claimed by ANALOG/THRESHOLD rules have no digital level to
+    # read, so they are excluded from every digital input check. Collected up
+    # front because a digital rule can come before the analog one.
+    analog_capable = set(analog_pins) if analog_pins is not None else set(analog_pins_for_board(board_map))
+    analog_used: set[str] = set()
+    for r in config.rules:
+        if r.is_analog and r.input in reserved:
+            analog_used.add(r.input)
+
+    # Axes driven by an ANALOG rule are overwritten every cycle: no store, no
+    # AXIS_INC/DEC, and only one ANALOG rule per axis.
+    analog_axes: dict[str, int] = {}
+    stored_axes = {a.id for a in config.axes if not a.comment and a.store}
+    for i, r in enumerate(config.rules):
+        if r.comment or r.type != "ANALOG":
+            continue
+        path = f"rules[{i}].axis"
+        if not r.axis:
+            errors.append(ValidationError(path, "An axis is required — define one on the Axes tab first"))
+        elif r.axis not in axis_ids:
+            errors.append(ValidationError(path, f"Unknown axis '{r.axis}'"))
+        elif r.axis in analog_axes:
+            errors.append(ValidationError(
+                path, f"Axis '{r.axis}' is already driven by rule {analog_axes[r.axis] + 1}"))
+        elif r.axis in stored_axes:
+            errors.append(ValidationError(
+                path, f"Axis '{r.axis}' cannot use store (its value comes from the sensor)"))
+        else:
+            analog_axes[r.axis] = i
+
     def check_input(path: str, value: str, what: str = "input"):
         if not value:
             errors.append(ValidationError(path, f"An {what} is required"))
+        elif value in analog_used:
+            errors.append(ValidationError(path, f"'{value}' is claimed as an analog input"))
         elif value not in valid_inputs:
             errors.append(ValidationError(path, f"Unknown {what} '{value}'"))
 
@@ -487,6 +634,8 @@ def validate(config: Config, board_map: str = "",
             for j, inp in enumerate(r.inputs):
                 if inp not in reserved:
                     errors.append(ValidationError(f"{path}.inputs[{j}]", f"Encoder pin must be a physical pin, not '{inp}'"))
+                elif inp in analog_used:
+                    errors.append(ValidationError(f"{path}.inputs[{j}]", f"Pin '{inp}' is claimed as an analog input"))
                 elif inp in encoder_pins:
                     errors.append(ValidationError(f"{path}.inputs[{j}]", f"Pin '{inp}' is already used by another encoder"))
                 else:
@@ -509,8 +658,67 @@ def validate(config: Config, board_map: str = "",
                 errors.append(ValidationError(f"{path}.axis", "An axis is required — define one on the Axes tab first"))
             elif r.axis not in axis_ids:
                 errors.append(ValidationError(f"{path}.axis", f"Unknown axis '{r.axis}'"))
+            elif r.axis in analog_axes:
+                errors.append(ValidationError(f"{path}.axis", f"Axis '{r.axis}' is driven by an ANALOG rule"))
             if not isinstance(r.step, int) or r.step < 1 or r.step > 65535:
                 errors.append(ValidationError(f"{path}.step", "Step must be 1-65535"))
+
+        elif r.type == "ANALOG":
+            if not r.input:
+                errors.append(ValidationError(f"{path}.input", "An input is required"))
+            elif r.input in reserved and r.input not in analog_capable:
+                errors.append(ValidationError(f"{path}.input", f"Pin '{r.input}' is not analog capable on this board"))
+            elif r.input not in analog_capable:
+                errors.append(ValidationError(f"{path}.input", f"Input '{r.input}' is not an analog pin"))
+            # axis checked in the pre-pass above
+            lo = 0 if r.min is None else r.min
+            hi = ANALOG_MAX if r.max is None else r.max
+            bounds_ok = True
+            for key, v in (("min", lo), ("max", hi)):
+                if not _in_range(v):
+                    errors.append(ValidationError(f"{path}.{key}", f"{key} must be an integer 0-65535"))
+                    bounds_ok = False
+            if bounds_ok and hi <= lo:
+                errors.append(ValidationError(f"{path}.max", "max must be greater than min"))
+                bounds_ok = False
+            dz = 0 if r.deadzone is None else r.deadzone
+            dz_ok = _in_range(dz)
+            if not dz_ok:
+                errors.append(ValidationError(f"{path}.deadzone", "deadzone must be an integer 0-65535"))
+            if r.center is not None:
+                if not _in_range(r.center):
+                    errors.append(ValidationError(f"{path}.center", "center must be an integer 0-65535"))
+                elif bounds_ok and dz_ok and not (lo < r.center - dz and r.center + dz < hi):
+                    errors.append(ValidationError(
+                        f"{path}.center", "center +/- deadzone must lie strictly between min and max"))
+            elif dz:
+                errors.append(ValidationError(f"{path}.deadzone", "deadzone requires center"))
+            if r.filter is not None and not (_is_int(r.filter) and 0 <= r.filter <= 8):
+                errors.append(ValidationError(f"{path}.filter", "filter must be an integer 0-8"))
+            if r.hysteresis is not None and not _in_range(r.hysteresis):
+                errors.append(ValidationError(f"{path}.hysteresis", "hysteresis must be an integer 0-65535"))
+            if r.curve is not None:
+                msg = _curve_error(r.curve)
+                if msg:
+                    errors.append(ValidationError(f"{path}.curve", msg))
+
+        elif r.type == "THRESHOLD":
+            if not r.input:
+                errors.append(ValidationError(f"{path}.input", "An input is required"))
+            elif r.input in reserved and r.input not in analog_capable:
+                errors.append(ValidationError(f"{path}.input", f"Pin '{r.input}' is not analog capable on this board"))
+            elif r.input not in analog_capable and r.input not in axis_ids:
+                errors.append(ValidationError(
+                    f"{path}.input", f"Input '{r.input}' must be an analog pin or an axis id"))
+            check_output(f"{path}.output", r.output)
+            if (r.above is None) == (r.below is None):
+                errors.append(ValidationError(f"{path}.above", "Set exactly one of above / below"))
+            else:
+                key = "above" if r.above is not None else "below"
+                if not _in_range(getattr(r, key)):
+                    errors.append(ValidationError(f"{path}.{key}", "threshold must be an integer 0-65535"))
+            if r.hysteresis is not None and not _in_range(r.hysteresis):
+                errors.append(ValidationError(f"{path}.hysteresis", "hysteresis must be an integer 0-65535"))
 
     # Firmware caps
     if len(config.bools) > 255:
