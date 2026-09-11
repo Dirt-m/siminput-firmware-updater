@@ -82,6 +82,21 @@ RESPONSE_TIMEOUT = 3.0
 WRITE_TIMEOUT = 5.0
 
 
+def describe_fault(fault: str) -> str:
+    """Human wording for get_info's `fault`, a hardware problem the firmware
+    worked around at boot. Unknown values are shown as-is so a newer firmware
+    is never silenced."""
+    if not fault:
+        return ""
+    if fault == "no_expander":
+        return "The I/O expander did not respond; its pins read as off until the box is power-cycled."
+    if fault.startswith("analog_init:"):
+        pin = fault.split(":", 1)[1] or "an analog pin"
+        return (f"{pin} could not be opened as an analog input; check the config and the pin. "
+                f"Rules using it are off and its axis sits at the default.")
+    return f"Device fault: {fault}"
+
+
 def _str_list(value) -> list[str] | None:
     """A JSON list of names, or None when the firmware did not send one."""
     if isinstance(value, list):

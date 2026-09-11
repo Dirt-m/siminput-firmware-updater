@@ -23,7 +23,8 @@ import customtkinter as ctk
 
 from .. import ui_theme as t
 from ..config_model import (
-    ANALOG_MAX, ANALOG_RULE_TYPES, RULE_TYPE_LABELS, Rule, _pin_sort_key, analog_pins_for_board,
+    ANALOG_HYSTERESIS_DEFAULT, ANALOG_MAX, ANALOG_RULE_TYPES, RULE_TYPE_LABELS,
+    THRESHOLD_HYSTERESIS_DEFAULT, Rule, _pin_sort_key, analog_pins_for_board,
 )
 from ..rule_list import RuleList
 from .calibrate_dialog import CalibrateDialog
@@ -301,7 +302,8 @@ class RuleCard(tk.Frame):
             self._field(r2, "Deadzone", lambda p: self._opt(p, "deadzone", self.rule.deadzone, "0"))
             r3 = self._row()
             self._field(r3, "Filter (0-8)", lambda p: self._opt(p, "filter", self.rule.filter, "2"))
-            self._field(r3, "Hysteresis", lambda p: self._opt(p, "hysteresis", self.rule.hysteresis, "0"))
+            self._field(r3, "Hysteresis", lambda p: self._opt(
+                p, "hysteresis", self.rule.hysteresis, str(ANALOG_HYSTERESIS_DEFAULT)))
             self._field(r3, "Curve", lambda p: self._curve(p))
             self._summary()
         elif tp == "THRESHOLD":
@@ -315,7 +317,8 @@ class RuleCard(tk.Frame):
             self._field(r2, "When", lambda p: self._mode(p))
             self._field(r2, "Value", lambda p: self._opt(
                 p, "threshold", self.rule.below if self.rule.above is None else self.rule.above, ""))
-            self._field(r2, "Hysteresis", lambda p: self._opt(p, "hysteresis", self.rule.hysteresis, "0"))
+            self._field(r2, "Hysteresis", lambda p: self._opt(
+                p, "hysteresis", self.rule.hysteresis, str(THRESHOLD_HYSTERESIS_DEFAULT)))
             self._summary()
         self._sync_summary()
         self._apply_errors()

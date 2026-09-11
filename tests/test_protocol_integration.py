@@ -421,6 +421,41 @@ class ProtocolIntegration(unittest.TestCase):
                                             analog_pins=["A1", "A2"])]
         self.assertIn("rules[2].input: 'A1' is claimed as an analog input", client)
 
+    def test_firmware_rule_caps_match_the_client(self):
+        self._needs_analog()
+        if not hasattr(serial_handler, "_MAX_ANALOG_RULES"):
+            self.skipTest("firmware checkout predates the analog rule caps (d5b0c86)")
+        # The count cap is checked before the per-rule pass, so one shared
+        # axis is enough (and keeps the axis-slot check out of the way).
+        too_many = {"device": {"name": "ProtoBox", "pid": 0xF001}, "axes": [{"id": "AX0", "output": 1}],
+                    "rules": [{"type": "ANALOG", "input": "A1", "axis": "AX0"} for _ in range(17)]}
+        with self.assertRaises(DeviceError) as ctx:
+            self.d.validate_config(too_many)
+        self.assertEqual(str(ctx.exception), "too many ANALOG rules (max 16)")
+        self.assertIn("rules: too many ANALOG rules (max 16)",
+                      [str(e) for e in validate(Config.from_dict(too_many), pins=["A1", "A2"],
+                                                analog_pins=["A1", "A2"])])
+
+        thresholds = {"device": {"name": "ProtoBox", "pid": 0xF001},
+                      "rules": [{"type": "THRESHOLD", "input": "A1", "output": f"B{i + 1}", "above": 100}
+                                for i in range(33)]}
+        with self.assertRaises(DeviceError) as ctx:
+            self.d.validate_config(thresholds)
+        self.assertEqual(str(ctx.exception), "too many THRESHOLD rules (max 32)")
+
+    def test_malformed_config_reports_the_detail(self):
+        self._needs_analog()
+        malformed = {"device": {"name": "ProtoBox", "pid": 0xF001},
+                     "rules": [{"type": "MAP", "input": ["D1"], "output": "B1"}]}
+        with self.assertRaises(DeviceError) as ctx:
+            self.d.validate_config(malformed)
+        # Shown verbatim in the UI; nothing pattern-matches on it.
+        self.assertTrue(str(ctx.exception), "the firmware must say what is wrong")
+        # And the chunked path (large configs) surfaces it too instead of going quiet.
+        malformed["padding"] = "x" * 4000
+        with self.assertRaises(DeviceError):
+            self.d.validate_config(malformed)
+
 
 if __name__ == "__main__":
     unittest.main()
