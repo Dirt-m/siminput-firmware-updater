@@ -38,7 +38,7 @@ sudo apt install python3-tk        # Ubuntu / Debian
 
 **Finds your controller automatically.** Discovery detects SIMINPUT boards by USB vendor ID and connects on its own.
 
-**Shows your inputs live.** A real-time monitor draws every button and axis at 200 Hz, so you can see exactly what the box is sending.
+**Shows your inputs live.** A real-time monitor draws every button, axis, and pin, so you can see exactly what the box is sending. The Configure page shows pressed pins and buttons under the editor, and a Learn button on any pin field fills it in from the switch you press.
 
 **Edits your config visually.** Device settings, boolean variables, axes, and input rules, all in a tabbed editor with a drag-to-reorder rule builder that flags problems as you type.
 
@@ -79,7 +79,7 @@ Three layers, kept separate:
 
 **Data** (`config_model.py`): pure dataclasses for the config, with JSON round-trip and validation that reports dotted paths like `rules[3].inputs`. No UI or serial imports.
 
-**Device** (`device.py`, `mock_device.py`): a JSON-line client over USB CDC serial. The real device and the mock share one interface. On Linux, live input monitoring reads HID state through evdev rather than the serial link, since serial is reserved for config and firmware commands.
+**Device** (`device.py`, `mock_device.py`): a JSON-line client over USB CDC serial. The real device and the mock share one interface. Buttons and axes are read through evdev on Linux; pin states come from the serial stream on every platform, which is paused while a command owns the port.
 
 **UI** (`app.py`, `pages/`, `widgets/`): the customtkinter front end, split into a device page, a configure page, and an update page. Serial work runs on background threads so the window stays responsive.
 
