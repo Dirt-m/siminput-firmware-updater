@@ -17,6 +17,7 @@ from ..config_model import (
     ValidationError,
     validate,
 )
+from ..widgets.live_panel import LivePanel
 from ..widgets.rule_editor import RuleEditor
 
 if TYPE_CHECKING:
@@ -120,7 +121,13 @@ class ConfigurePage(ctk.CTkFrame):
         self._create_problems_panel()
         self._create_tabs()
 
-        self.app.register_connection_listener(lambda c: self._refresh_connection_state())
+        # Live pins/buttons under the editor, fed by the shared monitor while
+        # this page is visible; the rule editor also gets the frames for Learn.
+        self.live_panel = LivePanel(self)
+        self.live_panel.grid(row=4, column=0, sticky="ew", pady=(12, 0))
+        self.app.register_theme_listener(self.live_panel.retheme)
+
+        self.app.register_connection_listener(self._on_connection)
         self._refresh_connection_state()
         self.app.bind("<Control-s>", self._on_ctrl_s, add="+")
 
@@ -354,11 +361,6 @@ class ConfigurePage(ctk.CTkFrame):
         tab.grid_columnconfigure(0, weight=1)
         tab.grid_rowconfigure(1, weight=1)
 
-        ctk.CTkLabel(
-            tab, text="Variables hold on/off state that rules can read and write — handy for latches and modes.",
-            font=t.font(12), text_color=t.TEXT_MUTED, anchor="w",
-        ).grid(row=0, column=0, padx=10, pady=(10, 4), sticky="w")
-
         self.vars_scroll = ctk.CTkScrollableFrame(tab, fg_color="transparent")
         self.vars_scroll.grid(row=1, column=0, sticky="nsew", padx=4, pady=4)
         self.vars_scroll.grid_columnconfigure(0, weight=1)
@@ -438,11 +440,6 @@ class ConfigurePage(ctk.CTkFrame):
         tab = self._tab_frames["Axes"]
         tab.grid_columnconfigure(0, weight=1)
         tab.grid_rowconfigure(1, weight=1)
-
-        ctk.CTkLabel(
-            tab, text="Axes map analog values to HID joystick outputs (X, Y, Z, …) or device backlight.",
-            font=t.font(12), text_color=t.TEXT_MUTED, anchor="w",
-        ).grid(row=0, column=0, padx=10, pady=(10, 4), sticky="w")
 
         self.axes_scroll = ctk.CTkScrollableFrame(tab, fg_color="transparent")
         self.axes_scroll.grid(row=1, column=0, sticky="nsew", padx=4, pady=4)
@@ -564,12 +561,6 @@ class ConfigurePage(ctk.CTkFrame):
         tab = self._tab_frames["Rules"]
         tab.grid_columnconfigure(0, weight=1)
         tab.grid_rowconfigure(1, weight=1)
-
-        ctk.CTkLabel(
-            tab, text="Rules run top to bottom. A rule can read the output of any rule above it. "
-                      "Drag ⠿ to reorder, right-click a rule for more.",
-            font=t.font(12), text_color=t.TEXT_MUTED, anchor="w",
-        ).grid(row=0, column=0, padx=10, pady=(10, 4), sticky="w")
 
         self.rule_editor = RuleEditor(tab, self)
         self.rule_editor.grid(row=1, column=0, sticky="nsew", padx=4, pady=4)
@@ -696,8 +687,26 @@ class ConfigurePage(ctk.CTkFrame):
             for b in (self._read_btn, self._save_btn):
                 b.configure(state="disabled", fg_color=t.SURFACE_3, text_color=t.TEXT_MUTED)
 
+    def _on_connection(self, connected: bool):
+        self._refresh_connection_state()
+        self.live_panel.set_connected(connected)
+        if not connected:
+            self.rule_editor.cancel_learn()
+
+    def _on_live(self, state: dict):
+        self.live_panel.update(state)
+        self.rule_editor.on_live_state(state)
+
     def on_show(self):
         self._refresh_connection_state()
+        self.live_panel.set_connected(bool(self.app.device.connected))
+        self.app.monitor.subscribe(self._on_live)
+        self.app.monitor.acquire()
+
+    def on_hide(self):
+        self.rule_editor.cancel_learn()
+        self.app.monitor.unsubscribe(self._on_live)
+        self.app.monitor.release()
 
     # ----------------------------------------------------------- actions
 

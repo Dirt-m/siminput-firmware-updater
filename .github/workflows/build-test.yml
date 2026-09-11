@@ -1,0 +1,38 @@
+name: Build test executable
+
+# Build a Windows executable for hands-on testing without cutting a release:
+# runs on every push to a chat/* branch (GitHub only registers manual
+# triggers once the file is on main), and on demand after that. Grab the
+# .exe from the run's artifacts.
+on:
+  push:
+    branches: ["chat/**"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Python dependencies
+        run: |
+          pip install --upgrade pip
+          pip install .[dev]
+
+      - name: Build executable
+        run: pyinstaller siminput-updater.spec
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: siminput-updater-windows-${{ github.sha }}
+          path: dist/siminput-updater.exe
+          retention-days: 14

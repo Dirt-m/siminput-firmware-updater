@@ -21,7 +21,7 @@ from typing import TYPE_CHECKING, Callable
 import customtkinter as ctk
 
 from .. import ui_theme as t
-from ..config_model import RULE_TYPE_LABELS, Rule
+from ..config_model import RULE_TYPE_LABELS, Rule, _pin_sort_key
 from ..rule_list import RuleList
 
 if TYPE_CHECKING:
@@ -31,6 +31,8 @@ RULE_TYPES = list(RULE_TYPE_LABELS.keys())
 HANDLE_GLYPH = "⠿"
 DUPLICATE_GLYPH = "❐"
 DELETE_GLYPH = "✕"
+LEARN_GLYPH = "◉"
+LEARN_TIMEOUT_MS = 20000
 SYNC_BUILD_COUNT = 12   # cards built before the first paint on a config load
 BUILD_CHUNK = 6         # cards per idle callback after that
 AUTOSCROLL_MARGIN = 28  # px from the viewport edge that starts auto-scroll
@@ -126,9 +128,11 @@ class RuleCard(tk.Frame):
         self._widgets: dict[str, object] = {}
         self._errors: dict[str, str] = {}
         self._err_label: tk.Label | None = None
+        self._learn_glyphs: dict[str, Glyph] = {}
         self._plain: list[tk.Widget] = []     # plain-tk children to retheme
         self._ctk_children: list = []          # CTk children needing bg_color sync
         self._rows: list[tk.Frame] = []
+        self._glyphs: list[Glyph] = []
 
         self.grid_columnconfigure(1, weight=1)
 
@@ -187,7 +191,7 @@ class RuleCard(tk.Frame):
         self._plain.append(actions)
         Glyph(actions, DUPLICATE_GLYPH, self._duplicate, t.TEXT_DIM, t.HOVER, bg).pack(side="left")
         Glyph(actions, DELETE_GLYPH, self._delete, t.ERROR, t.ERROR_SOFT, bg).pack(side="left")
-        self._glyphs = [w for w in actions.winfo_children()]
+        self._glyphs += [w for w in actions.winfo_children()]
 
     def _caption(self, parent, text: str, **kw) -> tk.Label:
         lbl = tk.Label(parent, text=text, bg=self._bg, fg=self._dim, font=self._cap_font, **kw)
@@ -200,6 +204,7 @@ class RuleCard(tk.Frame):
         for w in self.fields.winfo_children():
             w.destroy()
         self._widgets.clear()
+        self._learn_glyphs.clear()
         self._ctk_children = [c for c in self._ctk_children if c.winfo_exists()]
         self._plain = [w for w in self._plain if w.winfo_exists()]
         self._rows = []
@@ -208,13 +213,13 @@ class RuleCard(tk.Frame):
         tp = self.rule.type
         if tp in ("MAP", "TOGGLE"):
             r = self._row()
-            self._field(r, "Input", lambda p: self._pin(p, "input", self.rule.input))
+            self._field(r, "Input", lambda p: self._pin(p, "input", self.rule.input), learn="input")
             self._arrow(r)
             self._field(r, "Output", lambda p: self._pin(p, "output", self.rule.output))
             self._invert(r)
         elif tp == "PULSE":
             r = self._row()
-            self._field(r, "Input", lambda p: self._pin(p, "input", self.rule.input))
+            self._field(r, "Input", lambda p: self._pin(p, "input", self.rule.input), learn="input")
             self._arrow(r)
             self._field(r, "Output", lambda p: self._pin(p, "output", self.rule.output))
             self._invert(r)
@@ -224,7 +229,8 @@ class RuleCard(tk.Frame):
             self._summary()
         elif tp == "NOR":
             r = self._row()
-            self._field(r, "Inputs (any of)", lambda p: self._list(p, "inputs", self.rule.inputs))
+            self._field(r, "Inputs (any of)", lambda p: self._list(p, "inputs", self.rule.inputs),
+                        learn="inputs")
             self._arrow(r)
             self._field(r, "Output", lambda p: self._pin(p, "output", self.rule.output))
             self._invert(r)
@@ -232,8 +238,8 @@ class RuleCard(tk.Frame):
         elif tp == "ENCODER":
             pins = (list(self.rule.inputs) + ["", ""])[:2]
             r = self._row()
-            self._field(r, "Pin A", lambda p: self._pin(p, "pin_a", pins[0]))
-            self._field(r, "Pin B", lambda p: self._pin(p, "pin_b", pins[1]))
+            self._field(r, "Pin A", lambda p: self._pin(p, "pin_a", pins[0]), learn="pin_a")
+            self._field(r, "Pin B", lambda p: self._pin(p, "pin_b", pins[1]), learn="pin_b")
             self._field(r, "CW", lambda p: self._pin(p, "cw", self.rule.cw))
             self._field(r, "CCW", lambda p: self._pin(p, "ccw", self.rule.ccw))
             r2 = self._row()
@@ -243,7 +249,7 @@ class RuleCard(tk.Frame):
             self._summary()
         elif tp in ("AXIS_INC", "AXIS_DEC"):
             r = self._row()
-            self._field(r, "Input", lambda p: self._pin(p, "input", self.rule.input))
+            self._field(r, "Input", lambda p: self._pin(p, "input", self.rule.input), learn="input")
             self._field(r, "Axis", lambda p: self._axis(p))
             self._field(r, "Step", lambda p: self._num(p, "step", self.rule.step))
         self._sync_summary()
@@ -255,10 +261,20 @@ class RuleCard(tk.Frame):
         self._rows.append(row)
         return row
 
-    def _field(self, row, label, builder):
+    def _field(self, row, label, builder, learn: str | None = None):
         self._caption(row, label).pack(side="left", padx=(0, 6))
         widget = builder(row)
-        widget.pack(side="left", padx=(0, 18))
+        if learn:
+            # Physical-pin fields get a Learn button: press a switch on the
+            # box and its pin name lands in the field.
+            widget.pack(side="left", padx=(0, 2))
+            g = Glyph(row, LEARN_GLYPH, lambda k=learn: self.editor.toggle_learn(self, k),
+                      t.TEXT_MUTED, t.HOVER, self._bg, size=12)
+            g.pack(side="left", padx=(0, 14))
+            self._learn_glyphs[learn] = g
+            self._glyphs.append(g)
+        else:
+            widget.pack(side="left", padx=(0, 18))
         return widget
 
     def _arrow(self, row):
@@ -465,6 +481,28 @@ class RuleCard(tk.Frame):
         elif self._err_label is not None and self._err_label.winfo_exists():
             self._err_label.grid_remove()
 
+    def set_learning(self, key: str | None):
+        """Highlight the Learn button of `key` (None clears)."""
+        for k, g in self._learn_glyphs.items():
+            if g.winfo_exists():
+                g.configure(fg=t.resolve(t.ACCENT if k == key else t.TEXT_MUTED),
+                            bg=t.resolve(t.ACCENT_SOFT) if k == key else self._bg)
+
+    def apply_learned(self, key: str, pin: str):
+        w = self._widgets.get(key)
+        if w is None:
+            return
+        if key == "inputs":
+            current = [s.strip() for s in w.get().split(",") if s.strip()]
+            if pin not in current:
+                current.append(pin)
+            w.delete(0, "end")
+            w.insert(0, ", ".join(current))
+        else:
+            w.delete(0, "end")
+            w.insert(0, pin)
+        self._sync()
+
     def focus_field(self, field: str):
         target = self._widget_for(field)
         if isinstance(target, list):
@@ -582,6 +620,14 @@ class RuleEditor(ctk.CTkFrame):
         self._undo_after: str | None = None
         self.winfo_toplevel().bind("<Control-z>", lambda _e: self.undo_delete(), add="+")
 
+        # Learn mode: one (card, field) waiting for the next pin press.
+        self._hint = ctk.CTkLabel(bar, text="", font=t.font(12), text_color=t.ACCENT, anchor="w")
+        self._hint.grid(row=0, column=3, sticky="w", padx=(12, 4))
+        self._learn: tuple[RuleCard, str] | None = None
+        self._learn_after: str | None = None
+        self._hint_after: str | None = None
+        self.winfo_toplevel().bind("<Escape>", lambda _e: self.cancel_learn(), add="+")
+
         self.scroll = ctk.CTkScrollableFrame(self, fg_color="transparent")
         self.scroll.grid(row=1, column=0, sticky="nsew")
         self.scroll.grid_columnconfigure(0, weight=1)
@@ -631,6 +677,7 @@ class RuleEditor(ctk.CTkFrame):
         returns; the rest is built in idle-time chunks so a long config
         never freezes the window."""
         self._cancel_build()
+        self.cancel_learn()
         for card in self._cards:
             card.destroy()
         self._cards.clear()
@@ -764,6 +811,62 @@ class RuleEditor(ctk.CTkFrame):
         elif bottom > vis_bottom:
             canvas.yview_moveto(max(0.0, (bottom - view_h) / inner_h))
 
+    # -------------------------------------------------------------- learn
+
+    def toggle_learn(self, card: RuleCard, key: str):
+        if self._learn and self._learn[0] is card and self._learn[1] == key:
+            self.cancel_learn()
+            return
+        if not self.page.app.device.connected:
+            self.page.app.show_status("Connect a device to learn pins from it", "info")
+            return
+        self.cancel_learn()
+        self._learn = (card, key)
+        card.set_learning(key)
+        self._show_hint("Press a switch on the box…  (Esc to cancel)", None)
+        self._learn_after = self.after(LEARN_TIMEOUT_MS, self._learn_timeout)
+
+    def cancel_learn(self):
+        if self._learn is None:
+            return
+        card, _ = self._learn
+        self._learn = None
+        if card.winfo_exists():
+            card.set_learning(None)
+        if self._learn_after is not None:
+            self.after_cancel(self._learn_after)
+            self._learn_after = None
+        self._show_hint("", None)
+
+    def _learn_timeout(self):
+        self._learn_after = None
+        self.cancel_learn()
+        self._show_hint("No pin changed. Pins used by an encoder can't be learned.", 6000)
+
+    def on_live_state(self, state: dict):
+        """Monitor callback (UI thread). Completes a pending Learn on the
+        first pin that transitions to pressed; snapshot frames carry no
+        `changed` entries, so a fresh stream never triggers it."""
+        if self._learn is None:
+            return
+        pins = state.get("p") or {}
+        pressed = sorted((p for p in (state.get("changed") or ()) if pins.get(p)), key=_pin_sort_key)
+        if not pressed:
+            return
+        card, key = self._learn
+        self.cancel_learn()
+        if card.winfo_exists():
+            card.apply_learned(key, pressed[0])
+            self._show_hint(f"Learned {pressed[0]}", 2500)
+
+    def _show_hint(self, text: str, clear_after_ms: int | None):
+        if self._hint_after is not None:
+            self.after_cancel(self._hint_after)
+            self._hint_after = None
+        self._hint.configure(text=text)
+        if text and clear_after_ms:
+            self._hint_after = self.after(clear_after_ms, lambda: self._show_hint("", None))
+
     # --------------------------------------------------------- operations
 
     def add_rule(self):
@@ -788,6 +891,8 @@ class RuleEditor(ctk.CTkFrame):
         new.focus_first()
 
     def remove_card(self, card: RuleCard):
+        if self._learn and self._learn[0] is card:
+            self.cancel_learn()
         self._flush_build()
         index = self.index_of(card)
         card._apply_edits()
