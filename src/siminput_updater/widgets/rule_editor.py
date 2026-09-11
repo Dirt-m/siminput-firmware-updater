@@ -34,6 +34,7 @@ DELETE_GLYPH = "✕"
 SYNC_BUILD_COUNT = 12   # cards built before the first paint on a config load
 BUILD_CHUNK = 6         # cards per idle callback after that
 AUTOSCROLL_MARGIN = 28  # px from the viewport edge that starts auto-scroll
+UNDO_WINDOW_MS = 10000  # how long "Undo" stays offered after a delete
 
 
 def _entry(master, bg: str, width=78):
@@ -567,6 +568,20 @@ class RuleEditor(ctk.CTkFrame):
         self._count = ctk.CTkLabel(bar, text="", font=t.font(12), text_color=t.TEXT_MUTED, anchor="e")
         self._count.grid(row=0, column=1, sticky="e", padx=(12, 4))
 
+        # Delete is instant; the safety net is a one-shot Undo offered here
+        # for a few seconds (and on Ctrl+Z) instead of a confirm dialog.
+        self._undo_bar = ctk.CTkFrame(bar, fg_color=t.SURFACE_2, corner_radius=t.RADIUS)
+        self._undo_label = ctk.CTkLabel(self._undo_bar, text="", font=t.font(12), text_color=t.TEXT_DIM)
+        self._undo_label.grid(row=0, column=0, padx=(12, 6), pady=4)
+        self._undo_btn = ctk.CTkButton(
+            self._undo_bar, text="Undo", width=56, height=24, corner_radius=t.RADIUS,
+            fg_color="transparent", hover_color=t.HOVER, text_color=t.ACCENT,
+            font=t.font(12, "bold"), command=self.undo_delete)
+        self._undo_btn.grid(row=0, column=1, padx=(0, 6), pady=4)
+        self._undo: tuple[int, Rule] | None = None
+        self._undo_after: str | None = None
+        self.winfo_toplevel().bind("<Control-z>", lambda _e: self.undo_delete(), add="+")
+
         self.scroll = ctk.CTkScrollableFrame(self, fg_color="transparent")
         self.scroll.grid(row=1, column=0, sticky="nsew")
         self.scroll.grid_columnconfigure(0, weight=1)
@@ -775,12 +790,45 @@ class RuleEditor(ctk.CTkFrame):
     def remove_card(self, card: RuleCard):
         self._flush_build()
         index = self.index_of(card)
-        self._model.remove(index)
+        card._apply_edits()
+        rule = self._model.remove(index)
         self._cards.pop(index)
         card.destroy()
         self._regrid(index)
         self._renumber(index)
         self._changed()
+        self._offer_undo(index, rule)
+
+    def _offer_undo(self, index: int, rule: Rule):
+        self._undo = (index, rule)
+        self._undo_label.configure(text=f"Deleted rule {index + 1}")
+        self._undo_bar.grid(row=0, column=1, sticky="e", padx=(12, 12))
+        self._count.grid_configure(column=2)
+        if self._undo_after is not None:
+            self.after_cancel(self._undo_after)
+        self._undo_after = self.after(UNDO_WINDOW_MS, self._dismiss_undo)
+
+    def _dismiss_undo(self):
+        self._undo_after = None
+        self._undo = None
+        self._undo_bar.grid_remove()
+        self._count.grid_configure(column=1)
+
+    def undo_delete(self):
+        """Put the last deleted rule back where it was (or at the end if the
+        list is now shorter). One level: a new delete replaces the offer."""
+        if self._undo is None or not self.winfo_viewable():
+            return
+        index, rule = self._undo
+        if self._undo_after is not None:
+            self.after_cancel(self._undo_after)
+        self._dismiss_undo()
+        self._flush_build()
+        index = self._model.insert(index, rule)
+        card = RuleCard(self.scroll, self, rule)
+        self._place_card(card, index)
+        self._changed()
+        self._scroll_to(card)
 
     def move_card(self, card: RuleCard, dst: int):
         self._flush_build()

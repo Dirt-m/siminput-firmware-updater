@@ -122,6 +122,11 @@ class ConfigurePage(ctk.CTkFrame):
 
         self.app.register_connection_listener(lambda c: self._refresh_connection_state())
         self._refresh_connection_state()
+        self.app.bind("<Control-s>", self._on_ctrl_s, add="+")
+
+    def _on_ctrl_s(self, _event=None):
+        if self.winfo_viewable() and self._save_btn.cget("state") == "normal":
+            self._save_config()
 
     # ----------------------------------------------------------- toolbar
 
@@ -391,15 +396,31 @@ class ConfigurePage(ctk.CTkFrame):
         if bv.store:
             store_cb.select()
 
+        dup_btn = ctk.CTkButton(
+            frame, text="❐", width=30, height=30, corner_radius=t.RADIUS,
+            fg_color="transparent", hover_color=t.HOVER, text_color=t.TEXT_DIM,
+            command=lambda f=frame: self._duplicate_var(f))
+        dup_btn.grid(row=0, column=4, padx=(6, 0), pady=10)
         del_btn = ctk.CTkButton(
             frame, text="✕", width=30, height=30, corner_radius=t.RADIUS,
             fg_color="transparent", hover_color=t.ERROR_SOFT, text_color=t.ERROR,
             command=lambda f=frame: self._remove_var(f))
-        del_btn.grid(row=0, column=4, padx=(6, 12), pady=10)
+        del_btn.grid(row=0, column=5, padx=(0, 12), pady=10)
 
         self._var_widgets.append({"frame": frame, "name": name_entry, "default": default_switch,
                                   "store": store_cb, "extra": dict(bv.extra)})
         self._mark_dirty()
+
+    def _var_from_widgets(self, w: dict) -> BoolVar:
+        return BoolVar(id=w["name"].get().strip(), default=bool(w["default"].get()),
+                       store=bool(w["store"].get()), extra=dict(w.get("extra", {})))
+
+    def _duplicate_var(self, frame):
+        for w in self._var_widgets:
+            if w["frame"] is frame:
+                self._add_var(self._var_from_widgets(w))
+                self._var_widgets[-1]["name"].focus_set()
+                break
 
     def _remove_var(self, frame):
         for i, w in enumerate(self._var_widgets):
@@ -466,11 +487,16 @@ class ConfigurePage(ctk.CTkFrame):
         slot_menu.set(current_slot)
         slot_menu.grid(row=0, column=3, padx=6, pady=10)
 
+        dup_btn = ctk.CTkButton(
+            frame, text="❐", width=30, height=30, corner_radius=t.RADIUS,
+            fg_color="transparent", hover_color=t.HOVER, text_color=t.TEXT_DIM,
+            command=lambda f=frame: self._duplicate_axis(f))
+        dup_btn.grid(row=0, column=4, padx=(6, 0), pady=10, sticky="e")
         del_btn = ctk.CTkButton(
             frame, text="✕", width=30, height=30, corner_radius=t.RADIUS,
             fg_color="transparent", hover_color=t.ERROR_SOFT, text_color=t.ERROR,
             command=lambda f=frame: self._remove_axis(f))
-        del_btn.grid(row=0, column=4, columnspan=2, padx=(6, 12), pady=10, sticky="e")
+        del_btn.grid(row=0, column=5, padx=(0, 12), pady=10, sticky="e")
 
         ctk.CTkLabel(frame, text="Default", font=t.font(12), text_color=t.TEXT_DIM).grid(
             row=1, column=0, padx=(12, 6), pady=10)
@@ -507,6 +533,20 @@ class ConfigurePage(ctk.CTkFrame):
         widgets["default_val"] = round(value)
         widgets["default_lbl"].configure(text=str(widgets["default_val"]))
         self._mark_dirty()
+
+    def _axis_from_widgets(self, w: dict) -> Axis:
+        return Axis(
+            id=w["name"].get().strip(), output=w["slot_map"].get(w["slot"].get(), 1),
+            default=w["default_val"], store=bool(w["store"].get()),
+            backlight=bool(w["backlight"].get()), extra=dict(w.get("extra", {})),
+        )
+
+    def _duplicate_axis(self, frame):
+        for w in self._axis_widgets:
+            if w["frame"] is frame:
+                self._add_axis(self._axis_from_widgets(w))
+                self._axis_widgets[-1]["name"].focus_set()
+                break
 
     def _remove_axis(self, frame):
         for i, w in enumerate(self._axis_widgets):
@@ -577,20 +617,10 @@ class ConfigurePage(ctk.CTkFrame):
         device = DeviceSettings(name=name, pid=pid, debounce_ms=debounce,
                                 inactivity_refresh=refresh, extra=dict(self._device_extra))
 
-        bools = [BoolVar(
-            id=w["name"].get().strip(), default=bool(w["default"].get()), store=bool(w["store"].get()),
-            extra=dict(w.get("extra", {})),
-        ) for w in self._var_widgets]
+        bools = [self._var_from_widgets(w) for w in self._var_widgets]
         bools += [b for b in self._bool_comments]
 
-        axes = []
-        for w in self._axis_widgets:
-            output = w["slot_map"].get(w["slot"].get(), 1)
-            axes.append(Axis(
-                id=w["name"].get().strip(), output=output, default=w["default_val"],
-                store=bool(w["store"].get()), backlight=bool(w["backlight"].get()),
-                extra=dict(w.get("extra", {})),
-            ))
+        axes = [self._axis_from_widgets(w) for w in self._axis_widgets]
         axes += [a for a in self._axis_comments]
 
         rules = self.rule_editor.collect_rules()
