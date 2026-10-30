@@ -55,6 +55,20 @@ THRESHOLD_HYSTERESIS_DEFAULT = 256
 MAX_ANALOG_RULES = 16
 MAX_THRESHOLD_RULES = 32
 
+# An ENCODER rule with an axis is saved as the encoder plus an AXIS_INC /
+# AXIS_DEC pair reading its CW / CCW outputs, the shape the firmware links
+# into multi-detent axis steps (v2.4+). A blank CW / CCW gets a hidden helper
+# variable with this prefix so the encoder can turn an axis without also
+# pressing a button.
+ENCODER_HELPER_PREFIX = "_ENC_"
+
+
+def encoder_helper_id(rule: "Rule", key: str) -> str:
+    """Helper variable for an axis-linked encoder's blank `key` ("cw"/"ccw").
+    Keyed on the pins, which validation keeps unique per encoder."""
+    a, b = (list(rule.inputs) + ["", ""])[:2]
+    return f"{ENCODER_HELPER_PREFIX}{a}_{b}_{key.upper()}"
+
 AXIS_SLOT_LABELS = {
     1: "X", 2: "Y", 3: "Z",
     4: "Rx", 5: "Ry", 6: "Rz",
@@ -347,6 +361,31 @@ class Rule:
     def is_analog(self) -> bool:
         return not self.comment and self.type in ANALOG_RULE_TYPES
 
+    @property
+    def links_axis(self) -> bool:
+        return not self.comment and self.type == "ENCODER" and bool(self.axis)
+
+    def encoder_helpers(self) -> list[str]:
+        """Helper variable ids an axis-linked encoder needs (one per blank output)."""
+        if not self.links_axis:
+            return []
+        return [encoder_helper_id(self, key) for key in ("cw", "ccw") if not getattr(self, key)]
+
+    def expanded(self) -> list[dict]:
+        """The rule as saved to the device: an axis-linked encoder becomes the
+        encoder plus its AXIS_INC / AXIS_DEC pair. Config.from_dict folds that
+        shape back into one rule."""
+        if not self.links_axis:
+            return [self.to_dict()]
+        enc = self.copy()
+        enc.cw = self.cw or encoder_helper_id(self, "cw")
+        enc.ccw = self.ccw or encoder_helper_id(self, "ccw")
+        return [
+            enc.to_dict(),
+            Rule(type="AXIS_INC", input=enc.cw, axis=self.axis, step=self.step).to_dict(),
+            Rule(type="AXIS_DEC", input=enc.ccw, axis=self.axis, step=self.step).to_dict(),
+        ]
+
     def summary(self) -> str:
         if self.comment:
             for v in self.raw.values():
@@ -372,6 +411,8 @@ class Rule:
                 parts.append(f"CW: {_fmt_output(self.cw)}")
             if self.ccw:
                 parts.append(f"CCW: {_fmt_output(self.ccw)}")
+            if self.axis:
+                parts.append(f"{self.axis} ±{self.step} per step")
             return f"Encoder {pins} → {', '.join(parts) or 'no outputs'}"
         if t == "AXIS_INC":
             return f"{self.input} increases {self.axis} by {self.step}"
@@ -414,8 +455,9 @@ class Config:
         d: dict[str, Any] = dict(self.extra)
         d["device"] = self.device.to_dict()
         d["bools"] = [b.to_dict() for b in self.bools]
+        d["bools"] += [{"id": h, "default": False} for r in self.rules for h in r.encoder_helpers()]
         d["axes"] = [a.to_dict() for a in self.axes]
-        d["rules"] = [r.to_dict() for r in self.rules]
+        d["rules"] = [x for r in self.rules for x in r.expanded()]
         return d
 
     def to_json(self, indent: int = 2) -> str:
@@ -423,13 +465,53 @@ class Config:
 
     @classmethod
     def from_dict(cls, d: dict) -> Config:
-        return cls(
+        cfg = cls(
             device=DeviceSettings.from_dict(d.get("device", {})),
             bools=[BoolVar.from_dict(b) for b in d.get("bools", []) if isinstance(b, dict)],
             axes=[Axis.from_dict(a) for a in d.get("axes", []) if isinstance(a, dict)],
             rules=[Rule.from_dict(r) for r in d.get("rules", []) if isinstance(r, dict)],
             extra=_split_extra(d, cls._KNOWN),
         )
+        cfg._fold_encoder_links()
+        return cfg
+
+    def _fold_encoder_links(self):
+        """Inverse of Rule.expanded(): an ENCODER directly followed by an
+        AXIS_INC on its CW output and an AXIS_DEC on its CCW output, same axis
+        and step, becomes one axis-linked encoder. Hand-written configs in
+        that shape fold too and save back unchanged. A helper variable only
+        its encoder reads goes back to a blank output (to_dict re-adds it)."""
+        rules = self.rules
+        folded: list[Rule] = []
+        i = 0
+        while i + 2 < len(rules):
+            enc, inc, dec = rules[i:i + 3]
+            if (enc.type == "ENCODER" and not enc.comment and not enc.axis
+                    and inc.type == "AXIS_INC" and not inc.comment and not inc.extra
+                    and dec.type == "AXIS_DEC" and not dec.comment and not dec.extra
+                    and enc.cw and inc.input == enc.cw
+                    and enc.ccw and dec.input == enc.ccw
+                    and inc.axis and inc.axis == dec.axis and inc.step == dec.step):
+                enc.axis, enc.step = inc.axis, inc.step
+                del rules[i + 1:i + 3]
+                folded.append(enc)
+            i += 1
+        if not folded:
+            return
+
+        plain = {b.id: b for b in self.bools
+                 if not b.comment and not b.default and not b.store and not b.extra}
+        refs: dict[str, int] = {}
+        for r in rules:
+            if not r.comment:
+                for ref in (r.input, r.output, r.cw, r.ccw, *r.inputs):
+                    refs[ref] = refs.get(ref, 0) + 1
+        for enc in folded:
+            for key in ("cw", "ccw"):
+                ref = getattr(enc, key)
+                if ref == encoder_helper_id(enc, key) and ref in plain and refs[ref] == 1:
+                    setattr(enc, key, "")
+                    self.bools.remove(plain.pop(ref))
 
     @classmethod
     def from_json(cls, text: str) -> Config:
@@ -664,6 +746,18 @@ def validate(config: Config, board_map: str = "",
                 errors.append(ValidationError(f"{path}.divisor", "Steps/detent must be 1, 2, or 4"))
             if not isinstance(r.pulse_ms, int) or r.pulse_ms < 0:
                 errors.append(ValidationError(f"{path}.pulse_ms", "Pulse must be 0 ms or more"))
+            if r.axis:
+                if r.axis not in axis_ids:
+                    errors.append(ValidationError(f"{path}.axis", f"Unknown axis '{r.axis}'"))
+                elif r.axis in analog_axes:
+                    errors.append(ValidationError(f"{path}.axis", f"Axis '{r.axis}' is driven by an ANALOG rule"))
+                if not _is_int(r.step) or r.step < 1 or r.step > 65535:
+                    errors.append(ValidationError(f"{path}.step", "Step must be 1-65535"))
+                for key in ("cw", "ccw"):
+                    helper = encoder_helper_id(r, key)
+                    if not getattr(r, key) and (helper in bool_ids or helper in axis_ids):
+                        errors.append(ValidationError(
+                            f"{path}.{key}", f"'{helper}' is already defined; pick an output"))
 
         elif r.type in ("AXIS_INC", "AXIS_DEC"):
             check_input(f"{path}.input", r.input)
@@ -734,11 +828,15 @@ def validate(config: Config, board_map: str = "",
                 errors.append(ValidationError(f"{path}.hysteresis", "hysteresis must be an integer 0-65535"))
 
     # Firmware caps
-    if len(config.bools) > 255:
+    # Counted as saved: an axis-linked encoder adds two rules and up to two
+    # helper variables.
+    n_bools = len(config.bools) + sum(len(r.encoder_helpers()) for r in config.rules)
+    n_rules = len(config.rules) + 2 * sum(1 for r in config.rules if r.links_axis)
+    if n_bools > 255:
         errors.append(ValidationError("bools", "Too many variables (max 255)"))
     if len(config.axes) > 255:
         errors.append(ValidationError("axes", "Too many axes (max 255)"))
-    if len(config.rules) > 256:
+    if n_rules > 256:
         errors.append(ValidationError("rules", "Too many rules (max 256)"))
     if not errors:
         size = len(json.dumps(config.to_dict()))

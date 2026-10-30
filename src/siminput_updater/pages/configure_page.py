@@ -538,9 +538,23 @@ class ConfigurePage(ctk.CTkFrame):
         t.primary_button(tab, "+ Add axis", self._add_axis, width=120).grid(
             row=2, column=0, padx=8, pady=10, sticky="w")
 
+    def _new_axis(self, template: Axis | None = None) -> Axis:
+        """A fresh axis named AX1, AX2, … and put on an unused output slot,
+        skipping names and slots already taken. `template` supplies the rest."""
+        names = {w["name"].get().strip() for w in self._axis_widgets + self._var_widgets}
+        n = 1
+        while f"AX{n}" in names:
+            n += 1
+        ax = template or Axis()
+        ax.id = f"AX{n}"
+        if ax.output != "BACKLIGHT":
+            used = {w["slot_map"].get(w["slot"].get()) for w in self._axis_widgets}
+            ax.output = next((s for s in range(1, 9) if s not in used), ax.output)
+        return ax
+
     def _add_axis(self, ax: Axis | None = None):
         self._axes_empty.grid_remove()
-        ax = ax or Axis()
+        ax = ax or self._new_axis()
         frame = ctk.CTkFrame(self.axes_scroll, fg_color=t.SURFACE_2, corner_radius=t.RADIUS)
         frame.grid(sticky="ew", padx=4, pady=4)
         frame.grid_columnconfigure(1, weight=1)
@@ -627,7 +641,7 @@ class ConfigurePage(ctk.CTkFrame):
     def _duplicate_axis(self, frame):
         for w in self._axis_widgets:
             if w["frame"] is frame:
-                self._add_axis(self._axis_from_widgets(w))
+                self._add_axis(self._new_axis(self._axis_from_widgets(w)))
                 self._axis_widgets[-1]["name"].focus_set()
                 break
 

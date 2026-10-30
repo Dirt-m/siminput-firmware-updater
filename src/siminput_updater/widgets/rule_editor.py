@@ -40,6 +40,7 @@ LEARN_GLYPH = "◉"
 LEARN_TIMEOUT_MS = 20000
 ANALOG_LEARN_DELTA = 3000   # raw counts a sensor must move to be "the one"
 THRESHOLD_MODES = ("above", "below")
+NO_AXIS = "None"        # the encoder axis picker's "not linked" choice
 SYNC_BUILD_COUNT = 12   # cards built before the first paint on a config load
 BUILD_CHUNK = 6         # cards per idle callback after that
 AUTOSCROLL_MARGIN = 28  # px from the viewport edge that starts auto-scroll
@@ -322,6 +323,8 @@ class RuleCard(tk.Frame):
             r2 = self._row()
             self._field(r2, "Pulse (ms)", lambda p: self._num(p, "pulse_ms", self.rule.pulse_ms))
             self._field(r2, "Steps/detent", lambda p: self._num(p, "divisor", self.rule.divisor))
+            self._field(r2, "Axis", lambda p: self._axis(p))
+            self._field(r2, "Axis step", lambda p: self._num(p, "step", self.rule.step))
             self._invert(r2)
             self._summary()
         elif tp in ("AXIS_INC", "AXIS_DEC"):
@@ -482,11 +485,18 @@ class RuleCard(tk.Frame):
         self._glyphs.append(b)
         return b
 
-    def _axis(self, parent):
-        choices = self.editor.axis_choices() or [""]
-        current = self.rule.axis
+    def _axis_values(self, current: str) -> list[str]:
+        choices = self.editor.axis_choices()
         if current and current not in choices:
             choices = [current, *choices]
+        # An encoder's axis is optional; every other axis rule needs one.
+        if self.rule.type == "ENCODER":
+            return [NO_AXIS, *choices]
+        return choices or [""]
+
+    def _axis(self, parent):
+        current = self.rule.axis
+        choices = self._axis_values(current)
         picker = Picker(parent, choices, lambda _v: self._sync(), width_chars=12)
         picker.set(current or choices[0])
         self._widgets["axis"] = picker
@@ -497,11 +507,8 @@ class RuleCard(tk.Frame):
     def refresh_axis_choices(self):
         picker = self._widgets.get("axis")
         if picker is not None:
-            choices = self.editor.axis_choices() or [""]
             current = picker.get()
-            if current and current not in choices:
-                choices = [current, *choices]
-            picker.configure_values(choices)
+            picker.configure_values(self._axis_values("" if current == NO_AXIS else current))
         # A THRESHOLD input may be an axis id too.
         inp = self._widgets.get("input")
         if self.rule.type == "THRESHOLD" and isinstance(inp, Picker):
@@ -598,7 +605,8 @@ class RuleCard(tk.Frame):
         if "ccw" in w:
             self.rule.ccw = w["ccw"].get().strip()
         if "axis" in w:
-            self.rule.axis = w["axis"].get()
+            axis = w["axis"].get()
+            self.rule.axis = "" if axis == NO_AXIS else axis
         if "invert" in w:
             self.rule.invert = bool(w["invert"].get())
         for key in ("pulse_ms", "delay_ms", "step", "divisor"):
