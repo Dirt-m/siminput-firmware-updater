@@ -421,6 +421,14 @@ class ProtocolIntegration(unittest.TestCase):
                                             analog_pins=["A1", "A2"])]
         self.assertIn("rules[2].input: 'A1' is claimed as an analog input", client)
 
+    def test_firmware_accepts_an_axis_linked_encoder(self):
+        cfg = Config.from_dict({"device": {"name": "ProtoBox", "pid": 0xF001},
+                                "axes": [{"id": "AX1", "output": 1}],
+                                "rules": [{"type": "ENCODER", "inputs": ["D1", "D2"], "ccw": "B4"}]})
+        cfg.rules[0].axis, cfg.rules[0].step = "AX1", 1024
+        self.assertEqual([str(e) for e in validate(cfg, pins=["D1", "D2"])], [])
+        self.d.validate_config(cfg.to_dict())   # accepted by the firmware
+
     def test_firmware_rule_caps_match_the_client(self):
         self._needs_analog()
         if not hasattr(serial_handler, "_MAX_ANALOG_RULES"):

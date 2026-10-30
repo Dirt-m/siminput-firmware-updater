@@ -256,3 +256,78 @@ class AnalogRules(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class EncoderAxisLink(unittest.TestCase):
+    def _cfg(self, **enc):
+        rule = {"type": "ENCODER", "inputs": ["D1", "D2"], **enc}
+        return {"device": {"name": "Box", "pid": 0xF000},
+                "axes": [{"id": "AX1", "output": 1, "default": 32767}], "rules": [rule]}
+
+    def _linked(self, **kw):
+        cfg = Config.from_dict(self._cfg())
+        r = cfg.rules[0]
+        r.axis, r.step = "AX1", 2048
+        for k, v in kw.items():
+            setattr(r, k, v)
+        return cfg
+
+    def test_blank_outputs_expand_with_helper_variables(self):
+        out = self._linked().to_dict()
+        self.assertEqual(out["rules"], [
+            {"type": "ENCODER", "inputs": ["D1", "D2"], "cw": "_ENC_D1_D2_CW", "ccw": "_ENC_D1_D2_CCW"},
+            {"type": "AXIS_INC", "input": "_ENC_D1_D2_CW", "axis": "AX1", "step": 2048},
+            {"type": "AXIS_DEC", "input": "_ENC_D1_D2_CCW", "axis": "AX1", "step": 2048},
+        ])
+        self.assertEqual(out["bools"], [{"id": "_ENC_D1_D2_CW", "default": False},
+                                        {"id": "_ENC_D1_D2_CCW", "default": False}])
+
+    def test_button_outputs_are_used_directly(self):
+        out = self._linked(cw="B5", ccw="B6").to_dict()
+        self.assertEqual(out["bools"], [])
+        self.assertEqual([r["input"] for r in out["rules"][1:]], ["B5", "B6"])
+
+    def test_saved_form_folds_back_to_one_rule(self):
+        for kw in ({}, {"cw": "B5", "ccw": "B6"}, {"cw": "B5"}):
+            saved = self._linked(**kw).to_dict()
+            cfg = Config.from_dict(saved)
+            self.assertEqual(len(cfg.rules), 1, kw)
+            r = cfg.rules[0]
+            self.assertEqual((r.axis, r.step, r.cw, r.ccw),
+                             ("AX1", 2048, kw.get("cw", ""), kw.get("ccw", "")))
+            self.assertEqual(cfg.bools, [])
+            self.assertEqual(cfg.to_dict(), saved)
+
+    def test_non_adjacent_or_mismatched_pairs_stay_separate(self):
+        base = self._cfg(cw="B5", ccw="B6")
+        apart = dict(base, rules=base["rules"] + [
+            {"type": "MAP", "input": "D3", "output": "B1"},
+            {"type": "AXIS_INC", "input": "B5", "axis": "AX1"},
+            {"type": "AXIS_DEC", "input": "B6", "axis": "AX1"}])
+        self.assertEqual(len(Config.from_dict(apart).rules), 4)
+        mismatched = dict(base, rules=base["rules"] + [
+            {"type": "AXIS_INC", "input": "B5", "axis": "AX1", "step": 10},
+            {"type": "AXIS_DEC", "input": "B6", "axis": "AX1", "step": 20}])
+        self.assertEqual(len(Config.from_dict(mismatched).rules), 3)
+
+    def test_helper_read_by_another_rule_stays_an_output(self):
+        saved = self._linked().to_dict()
+        saved["rules"].append({"type": "MAP", "input": "_ENC_D1_D2_CW", "output": "B9"})
+        cfg = Config.from_dict(saved)
+        self.assertEqual(cfg.rules[0].cw, "_ENC_D1_D2_CW")
+        self.assertEqual(cfg.rules[0].ccw, "")
+        self.assertEqual([b.id for b in cfg.bools], ["_ENC_D1_D2_CW"])
+        self.assertEqual(cfg.to_dict(), saved)
+
+    def test_validation(self):
+        def errs(cfg):
+            return [str(e) for e in validate(cfg, board_map="rev2")]
+        self.assertEqual(errs(self._linked()), [])
+        self.assertIn("rules[0].axis: Unknown axis 'NOPE'", errs(self._linked(axis="NOPE")))
+        self.assertIn("rules[0].step: Step must be 1-65535", errs(self._linked(step=0)))
+        clash = self._linked()
+        clash.bools.append(BoolVar(id="_ENC_D1_D2_CW"))
+        self.assertTrue(any(e.startswith("rules[0].cw:") for e in errs(clash)))
+
+    def test_summary_mentions_the_axis(self):
+        self.assertIn("AX1 ±2048", self._linked().rules[0].summary())
