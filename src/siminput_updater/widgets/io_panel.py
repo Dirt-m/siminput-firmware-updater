@@ -67,7 +67,7 @@ class IOPanel(tk.Frame):
         super().__init__(parent, highlightthickness=1, bd=0)
         self._on_pin_click = on_pin_click
         self._on_button_click = on_button_click
-        self.mode = "side"
+        self.mode: str | None = None   # set by the first set_layout, which also packs the body
         self.collapsed = False
         self._cols = SIDE_COLS
         self._pins: list[str] = []
@@ -129,7 +129,7 @@ class IOPanel(tk.Frame):
         if mode == "band":
             fit = (width - self._gutter - 2 * self._pad + self._gap) // self._step
             cols = max(SIDE_COLS, fit // 10 * 10)
-        if (mode, collapsed, cols) == (self.mode, self.collapsed, self._cols) and self._items:
+        if (mode, collapsed, cols) == (self.mode, self.collapsed, self._cols):
             return
         self.mode, self.collapsed, self._cols = mode, collapsed, cols
         self._pack_body()
