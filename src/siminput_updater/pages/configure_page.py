@@ -17,6 +17,7 @@ from ..config_model import (
     ValidationError,
     validate,
 )
+from ..firmware import _write_backup
 from ..widgets.live_panel import LivePanel
 from ..widgets.rule_editor import RuleEditor
 
@@ -119,6 +120,14 @@ class ConfigurePage(ctk.CTkFrame):
         self._axis_comments: list[Axis] = []
         self._config_extra: dict = {}
         self._device_extra: dict = {}
+        # Whether the editor holds a real config (read from the box or
+        # imported). A blank editor validates clean, and saving it would wipe
+        # the box, so that save asks first.
+        self._has_config = False
+        # The box's config as last read or saved: the backup written before
+        # the next save overwrites it. None when unknown (e.g. a new box).
+        self._box_config: dict | None = None
+        self._skip_autoload = False  # our own save's reconnect: nothing new to read
 
         self.grid_columnconfigure(0, weight=1)
         self.grid_rowconfigure(3, weight=1)
@@ -764,6 +773,7 @@ class ConfigurePage(ctk.CTkFrame):
             self._axes_empty.grid()
 
         self.rule_editor.load_rules(config.rules)
+        self._has_config = True
         self._clear_dirty()
         self._validate_now()
 
@@ -793,8 +803,28 @@ class ConfigurePage(ctk.CTkFrame):
         # The connected firmware decides whether analog rule types are offered.
         self.rule_editor.refresh_type_menus()
         self._schedule_validate()
-        if not connected:
+        if connected:
+            # Posted, not called: this can run inside another operation's
+            # completion (a save's reconnect), which must finish first.
+            self.app.post(self._auto_load)
+        else:
             self.rule_editor.cancel_learn()
+            self._box_config = None
+
+    def _auto_load(self):
+        """Read the box's config on connect, so the editor always starts from
+        what is on the box. Unsaved edits are never replaced."""
+        if self._skip_autoload:
+            self._skip_autoload = False
+            return
+        if not self.app.device.connected or self.app.busy:
+            return
+        if self._dirty:
+            self.app.show_status(
+                "Kept your unsaved edits. Read from device loads this box's configuration.",
+                "info", 8000)
+            return
+        self._read_from_device(quiet=True)
 
     def _on_live(self, state: dict):
         if not self.app.analog_supported:
@@ -830,22 +860,47 @@ class ConfigurePage(ctk.CTkFrame):
         if not self.app.device.connected:
             self.app.show_status("No device connected", "error")
             return
+        if self.app.busy:
+            self.app.show_status("Busy with the device, try again in a moment", "info")
+            return
         if not self._confirm_discard("Reading from the device"):
             return
+        self._read_from_device(quiet=False)
 
+    def _read_from_device(self, quiet: bool):
         def work(ctx):
             ctx.status("Requesting configuration from device…")
             ctx.log("get_config")
             data = self.app.device.get_config()
             ctx.check_cancel()
             ctx.log("Parsing configuration")
-            return Config.from_dict(data)
+            return data, Config.from_dict(data)
 
-        def on_success(config):
+        def on_success(result):
+            if quiet and self._dirty:
+                # Edited while the background read ran: those edits win.
+                return
+            data, config = result
             self._load_config(config)
-            self.app.show_status("Configuration loaded from device", "success")
+            self._box_config = data
+            if not quiet:
+                self.app.show_status("Configuration loaded from device", "success")
 
-        self.app.run_operation("Reading configuration", work, on_success=on_success, success_message="Loaded")
+        self.app.run_operation("Reading configuration", work, on_success=on_success,
+                               success_message="Loaded", quiet=quiet)
+
+    def _confirm_replace(self) -> bool:
+        """Saving an editor that never held the box's config replaces the
+        whole box setup, which is rarely what a click on Save means."""
+        if self._has_config:
+            return True
+        from tkinter import messagebox
+        return messagebox.askyesno(
+            "Replace the box's configuration?",
+            "The editor does not hold this box's configuration (it was not read "
+            "from the box or imported).\n\nSaving replaces everything on the box "
+            "with what is in the editor now. Continue?",
+        )
 
     def _save_config(self):
         self.focus_set()  # commit the field being typed in
@@ -857,6 +912,11 @@ class ConfigurePage(ctk.CTkFrame):
         if not self.app.device.connected:
             self.app.show_status("No device connected", "error")
             return
+        if self.app.busy:
+            self.app.show_status("Busy with the device, try again in a moment", "info")
+            return
+        if not self._confirm_replace():
+            return
 
         payload = config.to_dict()
         device = self.app.device
@@ -867,10 +927,22 @@ class ConfigurePage(ctk.CTkFrame):
             or payload.get("device", {}).get("pid") != old_info.pid
         )
 
+        previous = self._box_config
+
         def work(ctx):
+            # Keep what is on the box now, so a bad save can be undone with
+            # Import JSON. Best effort: a failed backup never blocks the save.
+            backup = None
+            try:
+                old = previous if previous is not None else device.get_config()
+                if old != payload:
+                    backup = _write_backup(old)
+                    ctx.log(f"Previous configuration backed up to {backup}")
+            except Exception as e:
+                ctx.log(f"Backup skipped: {e}")
+            ctx.check_cancel()
             ctx.status("Writing configuration to device…")
             ctx.log("set_config")
-            ctx.check_cancel()
             resp = device.set_config(payload)
             ctx.log("Configuration written")
             # The device reboots to apply the config. Ride out the restart
@@ -886,15 +958,21 @@ class ConfigurePage(ctk.CTkFrame):
                     full = device.get_info()
                 except Exception:
                     pass
-                return info, full
-            return None
+                return (info, full), backup
+            return None, backup
 
         def on_success(result):
+            reconnected, backup = result
             self._clear_dirty()
-            if result is not None:
-                info, full = result
+            self._has_config = True
+            self._box_config = payload
+            if reconnected is not None:
+                info, full = reconnected
+                self._skip_autoload = True  # the editor already matches the box
                 self.app.notify_connected(info, full)
-            self.app.show_status("Configuration saved to device", "success")
+            self.app.show_status(
+                f"Configuration saved to device (previous one kept in {backup.parent.name})"
+                if backup else "Configuration saved to device", "success", 6000)
             if identity_changed:
                 self.app.show_status(
                     "USB name/PID changes take effect after unplugging the device",

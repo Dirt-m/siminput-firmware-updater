@@ -343,6 +343,11 @@ class App(ctk.CTk):
         return bool(self.device.connected)
 
     @property
+    def busy(self) -> bool:
+        """A device operation (or a connect) owns the port right now."""
+        return self._operation_active or self._connecting
+
+    @property
     def board_map(self) -> str:
         info = self.device.info if self.device.connected else None
         return info.board_map if info else ""
@@ -578,11 +583,14 @@ class App(ctk.CTk):
         on_success: Callable[[object], None] | None = None,
         success_message: str = "Done",
         indeterminate: bool = True,
+        quiet: bool = False,
     ):
         """Show the blocking overlay and run `work` on a worker thread.
 
         `work` receives an OperationContext for status/log/progress/cancel.
         Raising OperationCancelled or aborting via the overlay ends as cancelled.
+        A `quiet` operation skips the overlay (for short background work like
+        the read on connect) and reports a failure as a toast instead.
         """
         cancel = threading.Event()
         ctx = OperationContext(self, cancel)
@@ -590,7 +598,15 @@ class App(ctk.CTk):
         # The stream and commands share one port and one reader; the stream
         # has to be off before the worker sends anything.
         self.monitor.pause()
-        self.overlay.show(title, on_cancel=cancel.set, indeterminate=indeterminate)
+        if quiet:
+            finish_cancelled = lambda: None
+            finish_error = lambda msg: self.show_status(f"{title} failed: {msg}", "error", 6000)
+            finish_success = lambda: None
+        else:
+            self.overlay.show(title, on_cancel=cancel.set, indeterminate=indeterminate)
+            finish_cancelled = self.overlay.finish_cancelled
+            finish_error = self.overlay.finish_error
+            finish_success = lambda: self.overlay.finish_success(success_message)
 
         post = self.post
 
@@ -598,20 +614,20 @@ class App(ctk.CTk):
             try:
                 result = work(ctx)
             except OperationCancelled:
-                post(self._finish_operation(self.overlay.finish_cancelled))
+                post(self._finish_operation(finish_cancelled))
                 return
             except Exception as e:  # surface any device/IO error in the overlay
                 msg = str(e) or e.__class__.__name__
-                post(self._finish_operation(lambda: self.overlay.finish_error(msg)))
+                post(self._finish_operation(lambda: finish_error(msg)))
                 return
             if cancel.is_set():
-                post(self._finish_operation(self.overlay.finish_cancelled))
+                post(self._finish_operation(finish_cancelled))
                 return
 
             def done():
                 if on_success:
                     on_success(result)
-                self.overlay.finish_success(success_message)
+                finish_success()
             post(self._finish_operation(done))
 
         threading.Thread(target=runner, daemon=True).start()
