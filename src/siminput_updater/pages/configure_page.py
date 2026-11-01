@@ -158,7 +158,7 @@ class ConfigurePage(ctk.CTkFrame):
     def _create_toolbar(self):
         bar = ctk.CTkFrame(self, fg_color=t.SURFACE, corner_radius=t.RADIUS, height=58)
         bar.grid(row=0, column=0, sticky="ew")
-        bar.grid_columnconfigure(5, weight=1)
+        bar.grid_columnconfigure(6, weight=1)
         self._toolbar = bar
 
         self._read_btn = t.primary_button(bar, "Read from device", self._read_config, width=150)
@@ -169,10 +169,12 @@ class ConfigurePage(ctk.CTkFrame):
 
         ctk.CTkFrame(bar, width=1, height=26, fg_color=t.BORDER).grid(row=0, column=2, padx=14)
 
-        self._import_btn = t.ghost_button(bar, "Import JSON", self._import_json, width=110)
+        self._import_btn = t.ghost_button(bar, "Import…", self._import_json, width=84)
         self._import_btn.grid(row=0, column=3, padx=(0, 8), pady=12)
-        self._export_btn = t.ghost_button(bar, "Export JSON", self._export_json, width=110)
-        self._export_btn.grid(row=0, column=4, pady=12)
+        self._export_btn = t.ghost_button(bar, "Export…", self._export_json, width=84)
+        self._export_btn.grid(row=0, column=4, padx=(0, 8), pady=12)
+        self._history_btn = t.ghost_button(bar, "History…", self._open_history, width=84)
+        self._history_btn.grid(row=0, column=5, pady=12)
 
         # Problems are announced here as a count that never moves the layout;
         # clicking it floats the list over the page instead of pushing it down.
@@ -180,10 +182,11 @@ class ConfigurePage(ctk.CTkFrame):
             bar, text="", height=30, corner_radius=t.RADIUS, fg_color="transparent",
             hover_color=t.ERROR_SOFT, text_color=t.ERROR, font=t.font(12, "bold"),
             command=self._toggle_problems)
-        self._problems_btn.grid(row=0, column=5, padx=(16, 4), pady=12, sticky="e")
+        self._problems_btn.grid(row=0, column=6, padx=(16, 4), pady=12, sticky="e")
         self._problems_btn.grid_remove()
         self.dirty_label = ctk.CTkLabel(bar, text="", font=t.font(12, "bold"), text_color=t.WARN, anchor="e")
-        self.dirty_label.grid(row=0, column=6, padx=16, pady=12, sticky="e")
+        self.dirty_label.grid(row=0, column=7, padx=16, pady=12, sticky="e")
+        bar.bind("<Configure>", lambda _e: self._fit_toolbar(), add="+")
 
     def _create_tabs(self):
         self._tab_names = ("Device", "Variables", "Axes", "Rules")
@@ -809,11 +812,19 @@ class ConfigurePage(ctk.CTkFrame):
     def _mark_dirty(self, *_args):
         if not self._dirty:
             self._dirty = True
-            self.dirty_label.configure(text="Unsaved changes")
+            self.dirty_label.configure(text=self._dirty_text())
         self._schedule_validate()
         sidebar = getattr(self, "rules_sidebar", None)
         if sidebar is not None:
             sidebar.schedule_refresh()
+
+    def _dirty_text(self) -> str:
+        """Short in a narrow window, where the full words would be cut off."""
+        return "Unsaved" if self._toolbar.winfo_width() < t.px(self, 900) else "Unsaved changes"
+
+    def _fit_toolbar(self):
+        if self._dirty:
+            self.dirty_label.configure(text=self._dirty_text())
 
     def _clear_dirty(self):
         self._dirty = False
@@ -1037,6 +1048,24 @@ class ConfigurePage(ctk.CTkFrame):
             self.app.show_status(f"Imported {Path(path).name}", "success")
         except Exception as e:
             self.app.show_status(f"Import failed: {e}", "error", 6000)
+
+    def _open_history(self):
+        from ..widgets.history_dialog import HistoryDialog
+        HistoryDialog(self, self._load_backup)
+
+    def _load_backup(self, backup):
+        if not self._confirm_discard("Loading a backup"):
+            return
+        from ..config_history import read_backup
+        try:
+            config = read_backup(backup.path)
+        except Exception as e:
+            self.app.show_status(f"Couldn't read that backup: {e}", "error", 6000)
+            return
+        self._load_config(config)
+        self._mark_dirty()   # it is on screen, not on the box, until saved
+        when = backup.when.strftime("%d %b %H:%M")
+        self.app.show_status(f"Loaded the backup from {when}. Save to device to restore it.", "success", 6000)
 
     def _export_json(self):
         config = self._collect_config()
