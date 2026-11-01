@@ -118,6 +118,18 @@ class _Tooltip:
             self._win.withdraw()
 
 
+def _popup(menu: tk.Menu, x: int, y: int):
+    """Post a menu at root coordinates. On X11 tk_popup returns while the menu
+    is still open and its grab is what closes it on an outside click, so the
+    usual grab_release() afterwards would leave it stuck open. Elsewhere
+    tk_popup blocks until the menu closes and the release is the cleanup."""
+    try:
+        menu.tk_popup(x, y)
+    finally:
+        if menu.tk.call("tk", "windowingsystem") != "x11":
+            menu.grab_release()
+
+
 def _entry(master, bg: str, width=78):
     return ctk.CTkEntry(master, width=width, height=30, corner_radius=t.RADIUS, bg_color=bg,
                         fg_color=t.SURFACE_3, border_color=t.BORDER, font=t.mono(12))
@@ -168,10 +180,7 @@ class Picker(tk.Label):
         )
         for v in self._values:
             menu.add_command(label=v, command=lambda v=v: self._choose(v))
-        try:
-            menu.tk_popup(self.winfo_rootx(), self.winfo_rooty() + self.winfo_height())
-        finally:
-            menu.grab_release()
+        _popup(menu, self.winfo_rootx(), self.winfo_rooty() + self.winfo_height())
 
     def _choose(self, value: str):
         if value != self._value:
@@ -788,10 +797,7 @@ class RuleCard(tk.Frame):
         menu.add_separator()
         menu.add_command(label="Duplicate", command=self._duplicate)
         menu.add_command(label="Delete", command=self._delete)
-        try:
-            menu.tk_popup(event.x_root, event.y_root)
-        finally:
-            menu.grab_release()
+        _popup(menu, event.x_root, event.y_root)
 
     def _move_to_prompt(self):
         n = len(self.editor)
