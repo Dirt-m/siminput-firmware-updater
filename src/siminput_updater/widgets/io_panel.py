@@ -1,13 +1,18 @@
-"""Side panel on the Rules tab: every board pin and HID button at a glance.
+"""Pins and buttons panel on the Rules tab: every board pin and HID button
+at a glance.
 
 Each cell is free, used by a rule, on right now (live from the box), or
 part of the rule under the mouse. Clicking a free pin adds a Direct Map for
 it; clicking a used pin or assigned button scrolls to the rule.
 
+It never covers or squeezes the rule cards. When the tab is wide enough for
+the widest card plus the panel, it docks beside the cards (`side`);
+otherwise it lies across the bottom of the tab (`band`), where the full
+width gives long rows and the cards keep theirs. Either way it collapses to
+a one-line header.
+
 Both grids are one canvas, and state changes repaint only the cells whose
-state changed, so live frames and edits stay cheap. `RulesSidebar` owns the
-docking: beside the cards when the tab is wide enough, otherwise a thin
-strip that opens the panel as an overlay.
+state changed, so live frames and edits stay cheap.
 """
 
 from __future__ import annotations
@@ -26,22 +31,22 @@ if TYPE_CHECKING:
     from ..config_model import Rule
     from ..pages.configure_page import ConfigurePage
 
-COLS = 10            # decimal rows: B1-B10, B11-B20, … and D1-D10, …
 BUTTON_COUNT = 127   # B1..B127; B0 exists but the firmware never drives it
-CELL_MARGIN = 10     # logical px around the widest label inside a cell
-GAP = 3
-PAD = 12
-CARDS_MIN_W = 640    # logical width the rule cards need before the panel docks
+CELL_MARGIN = 6      # logical px around the widest label inside a cell
+GAP = 2
+PAD = 10
+SIDE_COLS = 10       # decimal rows: B1-B10, B11-B20, … and D1-D10, …
+CARDS_MIN_W = 900    # logical width the widest card (an encoder) needs, scrollbar included
+BAND_MAX_ROWS_H = 0.35  # the band never takes more than this share of the tab's height; it scrolls past that
 REFRESH_DELAY_MS = 150
-STRIP_W = 26
 
-# Light mode needs a stronger tint than ACCENT_SOFT to read apart from free cells.
-USED_BG = ("#C9CEF5", "#2C2F52")
+USED_BG = ("#C9CEF5", "#2C2F52")   # stronger than ACCENT_SOFT so it reads apart from free in light mode
 USED_FG = ("#3E4AB8", "#AEB4F2")
 HOVER_FILL = t.ACCENT
 HOVER_TEXT = ("#FFFFFF", "#FFFFFF")
+LEGEND = (("On now", t.CELL_ON), ("Used", USED_BG), ("Free", t.CELL_OFF), ("Hovered rule", HOVER_FILL))
 
-DEFAULT_INFO = "Hover a rule to see its pins and buttons here. Click a free pin to add a rule for it."
+DEFAULT_INFO = "Hover a rule to see its pins and buttons. Click a free pin to add a rule for it."
 
 
 def _rules_text(indices: list[int]) -> str:
@@ -54,13 +59,17 @@ def _rules_text(indices: list[int]) -> str:
 
 
 class IOPanel(tk.Frame):
-    """The pin grid and the button grid, drawn on one scrollable canvas."""
+    """The pin grid and the button grid on one canvas, laid out as a narrow
+    column (`side`) or as wide rows (`band`)."""
 
     def __init__(self, parent, on_pin_click: Callable[[str], None],
-                 on_button_click: Callable[[int], None], on_collapse: Callable[[], None]):
+                 on_button_click: Callable[[int], None], on_toggle: Callable[[], None]):
         super().__init__(parent, highlightthickness=1, bd=0)
         self._on_pin_click = on_pin_click
         self._on_button_click = on_button_click
+        self.mode = "side"
+        self.collapsed = False
+        self._cols = SIDE_COLS
         self._pins: list[str] = []
         self._pin_usage: dict[str, list[int]] = {}
         self._button_usage: dict[int, list[int]] = {}
@@ -70,33 +79,35 @@ class IOPanel(tk.Frame):
         self._tag_key: dict[str, tuple] = {}
         self._hover_key: tuple | None = None
 
-        self._font = t.tk_font(self, 11, mono=True)
+        self._font = t.tk_font(self, 10, mono=True)
         self._cap_font = t.tk_font(self, 11, "bold")
         self._small = t.tk_font(self, 11)
         self._cell = max(self._font.measure("127"), self._font.measure("D38"),
                          self._font.metrics("linespace")) + t.px(self, CELL_MARGIN)
         self._gap, self._pad = t.px(self, GAP), t.px(self, PAD)
-        self._width = 2 * self._pad + COLS * self._cell + (COLS - 1) * self._gap
+        self._step = self._cell + self._gap
+        self._gutter = max(self._cap_font.measure("BUTTONS"), self._small.measure("127 of 127")) + 2 * self._pad
 
+        # Header: title, legend, and the info line in band mode; the toggle
+        # collapses the panel to just this row.
         self._header = tk.Frame(self, bd=0)
-        self._header.pack(fill="x", padx=(self._pad, t.px(self, 4)), pady=(t.px(self, 6), 0))
-        self._title = tk.Label(self._header, text="PINS & BUTTONS", font=self._cap_font, anchor="w")
+        self._header.pack(side="top", fill="x", padx=(self._pad, t.px(self, 4)), pady=(t.px(self, 5), 0))
+        self._title = tk.Label(self._header, text="PINS & BUTTONS", font=self._cap_font, anchor="w", cursor="hand2")
         self._title.pack(side="left")
-        self._collapse = Glyph(self._header, "▸", on_collapse, t.TEXT_DIM, t.HOVER,
-                               t.resolve(t.CANVAS_BG), size=12)
-        self._collapse.pack(side="right")
+        self._title.bind("<Button-1>", lambda _e: on_toggle())
+        self._toggle = Glyph(self._header, "▾", on_toggle, t.TEXT_DIM, t.HOVER, t.resolve(t.CANVAS_BG), size=12)
+        self._toggle.pack(side="right")
+        self._legend = tk.Canvas(self._header, highlightthickness=0, bd=0, height=self._small.metrics("linespace"))
+        self._header_info = tk.Label(self._header, anchor="w", font=self._small)
 
-        self._info = tk.Label(self, text=DEFAULT_INFO, anchor="nw", justify="left", font=self._small,
-                              wraplength=self._width - 2 * self._pad, height=3)
-        self._info.pack(side="bottom", fill="x", padx=self._pad, pady=(t.px(self, 4), t.px(self, 8)))
-
-        body = tk.Frame(self, bd=0)
-        body.pack(fill="both", expand=True)
-        self._body = body
-        self.canvas = tk.Canvas(body, width=self._width, highlightthickness=0, bd=0)
-        self.canvas.pack(side="left", fill="y", expand=True)
-        self._scrollbar = ctk.CTkScrollbar(body, orientation="vertical", width=12,
+        self._info = tk.Label(self, anchor="nw", justify="left", font=self._small, height=3)
+        self.canvas = tk.Canvas(self, highlightthickness=0, bd=0)
+        # A small requested height: packed beside the band, the default 200
+        # would make the band tall enough to need no scrollbar, which then
+        # unpacks and shrinks it again, forever.
+        self._scrollbar = ctk.CTkScrollbar(self, orientation="vertical", width=12, height=20,
                                            command=self.canvas.yview)
+        self._yview: tuple | None = None
         self.canvas.configure(yscrollcommand=self._on_yscroll)
         for seq in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
             self.canvas.bind(seq, self._on_wheel)
@@ -106,6 +117,23 @@ class IOPanel(tk.Frame):
         self.retheme()
 
     # --------------------------------------------------------------- api
+
+    def side_width(self) -> int:
+        """Physical width the side layout needs."""
+        return 2 * self._pad + SIDE_COLS * self._step - self._gap + t.px(self, 14)
+
+    def set_layout(self, mode: str, collapsed: bool, width: int):
+        """`width` is the room in band mode; columns come in tens so rows
+        stay B1-B10, B11-B20, …"""
+        cols = SIDE_COLS
+        if mode == "band":
+            fit = (width - self._gutter - 2 * self._pad + self._gap) // self._step
+            cols = max(SIDE_COLS, fit // 10 * 10)
+        if (mode, collapsed, cols) == (self.mode, self.collapsed, self._cols) and self._items:
+            return
+        self.mode, self.collapsed, self._cols = mode, collapsed, cols
+        self._pack_body()
+        self._draw()
 
     def set_pins(self, pins: list[str]):
         pins = sorted(dict.fromkeys(pins), key=pin_order)
@@ -128,18 +156,45 @@ class IOPanel(tk.Frame):
         self._set_marks(self._hl, pins, buttons)
 
     def retheme(self):
-        # The inset canvas tone, like the Device page's button grid: free
-        # cells only stand out against it in dark mode.
+        # The inset canvas tone, like the Device page's button grid.
         surface = t.resolve(t.CANVAS_BG)
         self.configure(bg=surface, highlightbackground=t.resolve(t.BORDER),
                        highlightcolor=t.resolve(t.BORDER))
-        for w in (self._header, self._body):
+        for w in (self._header, self._legend, self.canvas):
             w.configure(bg=surface)
         self._title.configure(bg=surface, fg=t.resolve(t.TEXT_MUTED))
-        self._info.configure(bg=surface, fg=t.resolve(t.TEXT_DIM))
-        self._collapse.retheme()
-        self.canvas.configure(bg=surface)
+        for w in (self._info, self._header_info):
+            w.configure(bg=surface, fg=t.resolve(t.TEXT_DIM))
+        self._toggle.retheme()
+        self._draw_legend()
         self._draw()
+
+    # ----------------------------------------------------------- layout
+
+    def _pack_body(self):
+        for w in (self._legend, self._header_info, self._info, self.canvas, self._scrollbar):
+            w.pack_forget()
+        self._toggle.configure(text="▸" if self.collapsed else "▾")
+        if self.collapsed:
+            self._header.pack_configure(pady=t.px(self, 5))
+            self._header_info.pack(side="left", fill="x", expand=True, padx=(t.px(self, 12), 0))
+            return
+        self._header.pack_configure(pady=(t.px(self, 5), 0))
+        if self.mode == "band":
+            self._legend.pack(side="left", padx=(t.px(self, 16), 0))
+            self._header_info.pack(side="left", fill="x", expand=True, padx=(t.px(self, 16), 0))
+            self.canvas.pack(side="left", fill="both", expand=True)
+        else:
+            self._info.configure(wraplength=self.side_width() - 2 * self._pad)
+            self._info.pack(side="bottom", fill="x", padx=self._pad, pady=(t.px(self, 4), t.px(self, 6)))
+            self.canvas.configure(width=self.side_width() - t.px(self, 14))
+            self.canvas.pack(side="left", fill="y", expand=True)
+        self._show_info()
+
+    def content_height(self) -> int:
+        """Physical height the band needs to show everything without scrolling."""
+        region = self.canvas.cget("scrollregion")
+        return int(float(region.split()[-1])) if region else 0
 
     # ---------------------------------------------------------- drawing
 
@@ -151,72 +206,110 @@ class IOPanel(tk.Frame):
         marks["p"], marks["b"] = pins, buttons
         self._repaint(changed)
 
+    def _pin_rows(self) -> list[list[str]]:
+        """A new row per pin group (D, A, …), and every `cols` pins, so
+        D1-D10 lines up with B1-B10."""
+        rows: list[list[str]] = []
+        group = None
+        for p in self._pins:
+            g = pin_order(p)[:3]
+            if g != group or len(rows[-1]) == self._cols:
+                rows.append([])
+                group = g
+            rows[-1].append(p)
+        return rows
+
     def _draw(self):
         c = self.canvas
         c.delete("all")
         self._items.clear()
         self._tag_key.clear()
-        y = self._pad // 2
-        y = self._draw_legend(y)
-
-        y = self._section(y, "PINS", "sum_p")
-        rows: list[list[str]] = []
-        group = None
-        for p in self._pins:
-            g = pin_order(p)[:3]
-            # A new row per pin group (D, A, …) so D1-D10 lines up with B1-B10.
-            if g != group or len(rows[-1]) == COLS:
-                rows.append([])
-                group = g
-            rows[-1].append(p)
-        for row in rows:
-            for col, p in enumerate(row):
-                self._make_cell(("p", p), p, col, y)
-            y += self._cell + self._gap
-        if not rows:
-            c.create_text(self._pad, y, text="No pins known for this board.", anchor="nw",
-                          font=self._small, fill=t.resolve(t.TEXT_MUTED))
-            y += self._small.metrics("linespace")
-
-        y += t.px(self, 12)
-        y = self._section(y, "BUTTONS", "sum_b")
-        for n in range(1, BUTTON_COUNT + 1):
-            row, col = divmod(n - 1, COLS)
-            self._make_cell(("b", n), str(n), col, y + row * (self._cell + self._gap))
-        y += -(-BUTTON_COUNT // COLS) * (self._cell + self._gap)
-
-        c.configure(scrollregion=(0, 0, self._width, y + self._pad))
+        if self.collapsed:
+            self._draw_summaries()
+            return
+        pad = self._pad // 2
+        if self.mode == "band":
+            # Section labels sit in a gutter left of their rows.
+            x0, y = self._gutter, pad
+            y = self._section(y, "PINS", "sum_p", x0, self._pin_rows())
+            y += t.px(self, 6)
+            rows = [list(range(n, min(n + self._cols, BUTTON_COUNT + 1)))
+                    for n in range(1, BUTTON_COUNT + 1, self._cols)]
+            y = self._section(y, "BUTTONS", "sum_b", x0, rows)
+            width = x0 + self._cols * self._step
+        else:
+            x0, y = self._pad, pad
+            y = self._draw_canvas_legend(y)
+            y = self._section(y, "PINS", "sum_p", x0, self._pin_rows())
+            y += t.px(self, 10)
+            rows = [list(range(n, min(n + SIDE_COLS, BUTTON_COUNT + 1)))
+                    for n in range(1, BUTTON_COUNT + 1, SIDE_COLS)]
+            y = self._section(y, "BUTTONS", "sum_b", x0, rows)
+            width = self.side_width()
+        c.configure(scrollregion=(0, 0, width, y + pad))
         self._draw_summaries()
 
-    def _draw_legend(self, y: int) -> int:
+    def _section(self, y: int, title: str, summary_tag: str, x0: int, rows: list[list]) -> int:
         c = self.canvas
-        sw = t.px(self, 11)
-        x = self._pad
-        line = self._small.metrics("linespace")
-        for label, fill, outline in (("On now", t.CELL_ON, t.CELL_ON), ("Used", USED_BG, USED_BG),
-                                     ("Free", t.CELL_OFF, t.CELL_BORDER), ("Hovered rule", HOVER_FILL, HOVER_FILL)):
-            c.create_rectangle(x, y + (line - sw) / 2, x + sw, y + (line + sw) / 2,
-                               fill=t.resolve(fill), outline=t.resolve(outline))
-            x += sw + t.px(self, 5)
-            c.create_text(x, y, text=label, anchor="nw", font=self._small, fill=t.resolve(t.TEXT_DIM))
-            x += self._small.measure(label) + t.px(self, 12)
-        return y + line + t.px(self, 12)
+        muted = t.resolve(t.TEXT_MUTED)
+        if self.mode == "band":
+            c.create_text(self._pad, y, text=title, anchor="nw", font=self._cap_font, fill=muted)
+            c.create_text(self._pad, y + self._cap_font.metrics("linespace"), text="", anchor="nw",
+                          font=self._small, fill=muted, tags=summary_tag)
+        else:
+            c.create_text(x0, y, text=title, anchor="nw", font=self._cap_font, fill=muted)
+            c.create_text(self.side_width() - self._pad - t.px(self, 14), y, text="", anchor="ne",
+                          font=self._small, fill=muted, tags=summary_tag)
+            y += self._cap_font.metrics("linespace") + t.px(self, 4)
+        if not rows:
+            c.create_text(x0, y, text="No pins known for this board.", anchor="nw",
+                          font=self._small, fill=muted)
+            return y + self._small.metrics("linespace")
+        for row in rows:
+            for col, name in enumerate(row):
+                key = ("p", name) if isinstance(name, str) else ("b", name)
+                self._make_cell(key, str(name), x0 + col * self._step, y)
+            y += self._step
+        return y
 
-    def _section(self, y: int, title: str, summary_tag: str) -> int:
-        c = self.canvas
-        c.create_text(self._pad, y, text=title, anchor="nw", font=self._cap_font,
-                      fill=t.resolve(t.TEXT_MUTED))
-        c.create_text(self._width - self._pad, y, text="", anchor="ne", font=self._small,
-                      fill=t.resolve(t.TEXT_MUTED), tags=summary_tag)
-        return y + self._cap_font.metrics("linespace") + t.px(self, 6)
+    def _draw_canvas_legend(self, y: int) -> int:
+        """Side mode: the legend is the canvas's first line."""
+        x = self._pad
+        for label, fill in LEGEND:
+            x = self._swatch(self.canvas, x, y, label, fill)
+        return y + self._small.metrics("linespace") + t.px(self, 8)
+
+    def _draw_legend(self):
+        """Band mode: the legend sits in the header row."""
+        lg = self._legend
+        lg.delete("all")
+        x = 0
+        for label, fill in LEGEND:
+            x = self._swatch(lg, x, 0, label, fill)
+        lg.configure(width=x)
+
+    def _swatch(self, c: tk.Canvas, x: int, y: int, label: str, fill) -> int:
+        sw = t.px(self, 10)
+        line = self._small.metrics("linespace")
+        c.create_rectangle(x, y + (line - sw) / 2, x + sw, y + (line + sw) / 2,
+                           fill=t.resolve(fill), outline=t.resolve(fill))
+        x += sw + t.px(self, 4)
+        c.create_text(x, y, text=label, anchor="nw", font=self._small, fill=t.resolve(t.TEXT_DIM))
+        return x + self._small.measure(label) + t.px(self, 10)
 
     def _draw_summaries(self):
         pins_used = sum(1 for p in self._pins if p in self._pin_usage)
-        self.canvas.itemconfigure("sum_p", text=f"{pins_used} of {len(self._pins)} used")
-        self.canvas.itemconfigure("sum_b", text=f"{len(self._button_usage)} of {BUTTON_COUNT} assigned")
+        pins, buttons = f"{pins_used} of {len(self._pins)}", f"{len(self._button_usage)} of {BUTTON_COUNT}"
+        if self.mode == "band":
+            self.canvas.itemconfigure("sum_p", text=pins)
+            self.canvas.itemconfigure("sum_b", text=buttons)
+        else:
+            self.canvas.itemconfigure("sum_p", text=f"{pins} used")
+            self.canvas.itemconfigure("sum_b", text=f"{buttons} assigned")
+        if self.collapsed:
+            self._header_info.configure(text=f"{pins} pins used, {buttons} buttons assigned")
 
-    def _make_cell(self, key: tuple, label: str, col: int, y: int):
-        x = self._pad + col * (self._cell + self._gap)
+    def _make_cell(self, key: tuple, label: str, x: int, y: int):
         tag = f"k{len(self._tag_key)}"
         self._tag_key[tag] = key
         rect = self.canvas.create_rectangle(x, y, x + self._cell, y + self._cell, tags=("cell", tag))
@@ -279,6 +372,8 @@ class IOPanel(tk.Frame):
             self._on_button_click(name)
 
     def _show_info(self):
+        if self.collapsed:
+            return
         key = self._hover_key
         if key is None:
             text = DEFAULT_INFO
@@ -292,15 +387,21 @@ class IOPanel(tk.Frame):
             users = self._button_usage.get(n)
             text = (f"Button {n} is set by {_rules_text(users)}. Click to show it." if users
                     else f"Button {n} is free.")
-        if self._info.cget("text") != text:
-            self._info.configure(text=text)
+        label = self._header_info if self.mode == "band" else self._info
+        if label.cget("text") != text:
+            label.configure(text=text)
 
     def _on_yscroll(self, first, last):
+        # CTkScrollbar.set redraws through update_idletasks, which can call
+        # back in here; only act on a real change.
+        if (first, last) == self._yview:
+            return
+        self._yview = (first, last)
         if float(first) <= 0.0 and float(last) >= 1.0:
             if self._scrollbar.winfo_manager():
                 self._scrollbar.pack_forget()
-        elif not self._scrollbar.winfo_manager():
-            self._scrollbar.pack(side="right", fill="y")
+        elif not self._scrollbar.winfo_manager() and self.canvas.winfo_manager():
+            self._scrollbar.pack(side="right", fill="y", before=self.canvas)
         self._scrollbar.set(first, last)
 
     def _on_wheel(self, event):
@@ -319,30 +420,23 @@ class IOPanel(tk.Frame):
 class RulesSidebar:
     """Places the IOPanel on the Rules tab and keeps it fed.
 
-    Docked in the tab's second column when the cards still get
-    CARDS_MIN_W beside it; otherwise a thin strip, and the panel opens over
-    the right side of the cards (Esc or the strip closes it)."""
+    Beside the cards (tab column 1) when the cards still get CARDS_MIN_W;
+    otherwise across the bottom (tab row 2), sized to its content but never
+    more than BAND_MAX_ROWS_H of the tab. The header's toggle collapses it to
+    one line in either place."""
 
     def __init__(self, tab, page: ConfigurePage):
         self.tab, self.page = tab, page
         self.editor = page.rule_editor
-        self.panel = IOPanel(tab, self._pin_click, self._button_click, self._collapse)
-        self.strip = tk.Canvas(tab, width=t.px(tab, STRIP_W), highlightthickness=1, bd=0, cursor="hand2")
-        self.strip.bind("<Button-1>", lambda _e: self._expand())
-        self.strip.bind("<Configure>", lambda _e: self._draw_strip())
-        self.strip.bind("<Enter>", lambda _e: self.strip.configure(bg=t.resolve(t.HOVER)))
-        self.strip.bind("<Leave>", lambda _e: self.strip.configure(bg=t.resolve(t.SURFACE_2)))
-        self._want_open = True   # docked whenever there is room
-        self._overlay = False    # opened over the cards in a narrow window
-        self._mode: str | None = None
+        self.panel = IOPanel(tab, self._pin_click, self._button_click, self._toggle)
+        self._collapsed = False
+        self._placed: str | None = None
         self._hover_rule: Rule | None = None
         self._refresh_after: str | None = None
 
         self.editor.hover_listener = self._on_rule_hover
         tab.bind("<Configure>", lambda _e: self._layout(), add="+")
-        page.app.bind("<Escape>", lambda _e: self._close_overlay(), add="+")
-        page.app.register_theme_listener(self.retheme)
-        self.retheme()
+        page.app.register_theme_listener(self.panel.retheme)
         self.refresh_pins()
         self._layout()
 
@@ -355,6 +449,7 @@ class RulesSidebar:
         except Exception:
             pins = pins_for_board("")
         self.panel.set_pins(list(pins))
+        self._place_band()
         self.refresh()
 
     def schedule_refresh(self):
@@ -390,8 +485,6 @@ class RulesSidebar:
 
     def _pin_click(self, pin: str):
         users = self.editor.model.pin_usage().get(pin)
-        # The overlay would cover the card the click is about.
-        self._close_overlay()
         if users:
             self.editor.reveal(users[0])
         else:
@@ -401,66 +494,42 @@ class RulesSidebar:
     def _button_click(self, n: int):
         users = self.editor.model.button_usage().get(n)
         if users:
-            self._close_overlay()
             self.editor.reveal(users[0])
 
     # ------------------------------------------------------------- layout
 
-    def _wide(self) -> bool:
-        return self.tab.winfo_width() >= t.px(self.tab, CARDS_MIN_W) + self.panel.winfo_reqwidth()
+    def _toggle(self):
+        self._collapsed = not self._collapsed
+        self._placed = None
+        self._layout()
 
     def _layout(self):
-        mode = "docked" if (self._wide() and self._want_open) else ("overlay" if self._overlay else "strip")
-        if mode == self._mode:
+        width = self.tab.winfo_width()
+        if width <= 1:
             return
-        self._mode = mode
-        if mode == "docked":
-            self._overlay = False
-            self.panel.place_forget()
-            self.strip.grid_remove()
-            self.panel.grid(row=1, column=1, sticky="ns", padx=(t.px(self.tab, 6) // 2, 0), pady=4)
+        side = (not self._collapsed
+                and width >= t.px(self.tab, CARDS_MIN_W) + self.panel.side_width())
+        mode = "side" if side else "band"
+        self.panel.set_layout(mode, self._collapsed, width - t.px(self.tab, 8))
+        if mode == self._placed:
+            if mode == "band":
+                self._place_band()
             return
-        self.panel.grid_remove()
-        self.strip.grid(row=1, column=1, sticky="ns", padx=(4, 0), pady=4)
-        if mode == "overlay":
-            self.panel.place(in_=self.tab, relx=1.0, x=-(t.px(self.tab, STRIP_W) + 6), y=4,
-                             relheight=1.0, height=-8, anchor="ne")
-            self.panel.lift()
+        self._placed = mode
+        self.panel.grid_forget()
+        if side:
+            self.panel.grid(row=1, column=1, rowspan=1, sticky="ns", padx=(t.px(self.tab, 3), 0), pady=4)
         else:
-            self.panel.place_forget()
-        self._draw_strip()
+            self.panel.grid(row=2, column=0, columnspan=2, sticky="ew", padx=4, pady=(4, 4))
+            self._place_band()
 
-    def _expand(self):
-        if self._wide():
-            self._want_open = True
-        else:
-            self._overlay = not self._overlay
-        self._layout()
-
-    def _collapse(self):
-        if self._mode == "overlay":
-            self._overlay = False
-        else:
-            self._want_open = False
-        self._layout()
-
-    def _close_overlay(self):
-        if self._overlay:
-            self._overlay = False
-            self._layout()
-
-    # -------------------------------------------------------------- theme
-
-    def retheme(self):
-        self.panel.retheme()
-        self.strip.configure(bg=t.resolve(t.SURFACE_2), highlightbackground=t.resolve(t.BORDER),
-                             highlightcolor=t.resolve(t.BORDER))
-        self._draw_strip()
-
-    def _draw_strip(self):
-        s = self.strip
-        s.delete("all")
-        w = s.winfo_width() if s.winfo_width() > 1 else t.px(s, STRIP_W)
-        s.create_text(w / 2, t.px(s, 16), text="▸" if self._mode == "overlay" else "◂", font=t.tk_font(s, 12), fill=t.resolve(t.TEXT_DIM))
-        s.create_text(w / 2, t.px(s, 32), text="PINS & BUTTONS", angle=270, anchor="w",
-                      font=t.tk_font(s, 11, "bold"), fill=t.resolve(t.TEXT_DIM))
+    def _place_band(self):
+        """Band height: all rows when they fit, else a capped, scrolling view."""
+        if self._placed != "band" or self._collapsed:
+            self.panel.canvas.configure(height=1)
+            return
+        need = self.panel.content_height()
+        cap = int(self.tab.winfo_height() * BAND_MAX_ROWS_H)
+        h = max(t.px(self.tab, 60), min(need, cap)) if cap > 0 else need
+        if int(float(self.panel.canvas.cget("height"))) != h:
+            self.panel.canvas.configure(height=h)
