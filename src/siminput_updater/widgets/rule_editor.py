@@ -34,7 +34,8 @@ from ..config_model import (
 )
 from ..rule_list import (
     History, RuleList, can_create_variable, diff_span, insert_rules, move_to_gap, nudge,
-    rank_suggestions, ref_candidates, remove_indices, rule_inputs, rules_from_text, rules_to_text,
+    rank_suggestions, ref_candidates, remove_indices, rule_inputs, rule_matches, rules_from_text,
+    rules_to_text,
 )
 from . import suggest
 from .calibrate_dialog import CalibrateDialog
@@ -56,6 +57,8 @@ BUILD_CHUNK = 6         # cards per idle callback after that
 AUTOSCROLL_MARGIN = 28  # px from the viewport edge that starts auto-scroll
 UNDO_WINDOW_MS = 10000  # how long "Undo" stays offered after a delete
 EDIT_COMMIT_MS = 700    # a pause in typing this long ends one undo step
+FILTER_DELAY_MS = 120   # debounce for the filter field
+COUNT_MIN_W = 780       # logical toolbar width below which the rule count is dropped
 SHIFT, CONTROL = 0x1, 0x4   # event.state bits
 CREATE_PREFIX = "\0create:"   # a suggestion value that makes a new variable
 IN_FIELDS = ("input", "pin_a", "pin_b", "inputs")
@@ -231,6 +234,8 @@ class RuleCard(tk.Frame):
         self._learn_glyphs: dict[str, Glyph] = {}
         self._live = False    # reads a pin that is pressed on the box right now
         self._selected = False
+        self._compact = False
+        self._compact_lbl: tk.Label | None = None
         self._plain: list[tk.Widget] = []     # plain-tk children to retheme
         self._ctk_children: list = []          # CTk children needing bg_color sync
         self._rows: list[tk.Frame] = []
@@ -303,7 +308,41 @@ class RuleCard(tk.Frame):
             self._selectable(w)
         if not rule.comment:
             self._selectable(self.fields)
+        if editor.compact:
+            self.set_compact(True)
 
+    def set_compact(self, on: bool):
+        """Compact: the fields give way to the rule's one-line summary; a
+        click on it opens the card again."""
+        if self.rule.comment or on == self._compact:
+            return
+        self._compact = on
+        if on:
+            if self._compact_lbl is None:
+                self._compact_lbl = tk.Label(self.body, anchor="w", bg=self._bg, font=self._cap_font,
+                                             cursor="hand2")
+                self._compact_lbl.bind("<Button-1>", lambda _e: self._expand())
+            self.fields.grid_remove()
+            self._compact_lbl.grid(row=0, column=1, sticky="w")
+            self._paint_compact()
+        else:
+            if self._compact_lbl is not None:
+                self._compact_lbl.grid_remove()
+            self.fields.grid()
+
+    def _expand(self):
+        self.set_compact(False)
+        self.focus_first()
+
+    def _paint_compact(self):
+        """The summary, red while the rule has a problem (its fields, which
+        would show it, are hidden)."""
+        lbl = self._compact_lbl
+        if lbl is None or not self._compact:
+            return
+        bad = bool(self._errors)
+        lbl.configure(text=self.rule.summary() + ("   ⚠ click to fix" if bad else ""), bg=self._bg,
+                      fg=t.resolve(t.ERROR) if bad else t.resolve(t.TEXT))
     def _selectable(self, widget):
         widget.bind("<Button-1>", lambda e: self.editor.click_select(self, e.state), add="+")
 
@@ -616,6 +655,7 @@ class RuleCard(tk.Frame):
         for c in self._ctk_children:
             if c.winfo_exists():
                 c.configure(bg_color=bg)
+        self._paint_compact()
 
     def paint_border(self, color=None):
         """Outline in `color`, else accent while selected, else green while a
@@ -670,6 +710,7 @@ class RuleCard(tk.Frame):
     def _sync_summary(self):
         if self.summary is not None and self.summary.winfo_exists() and not self.rule.comment:
             self.summary.configure(text=self.rule.summary())
+        self._paint_compact()
 
     def _apply_edits(self):
         w = self._widgets
@@ -724,7 +765,9 @@ class RuleCard(tk.Frame):
         widget holds `focused` are skipped and returned, so a value still
         being typed is not flagged mid-word."""
         self._errors = dict(errors)
-        return self._apply_errors(focused)
+        suppressed = self._apply_errors(focused)
+        self._paint_compact()
+        return suppressed
 
     def _widget_for(self, field: str):
         """Validator field → the widget that edits it (None if not shown)."""
@@ -921,7 +964,7 @@ class RuleEditor(ctk.CTkFrame):
         self.grid_rowconfigure(1, weight=1)
 
         # Top bar: the primary action lives here, never below the fold.
-        bar = ctk.CTkFrame(self, fg_color="transparent")
+        bar = self._bar = ctk.CTkFrame(self, fg_color="transparent")
         bar.grid(row=0, column=0, sticky="ew", padx=4, pady=(0, 8))
         bar.grid_columnconfigure(3, weight=1)
         t.primary_button(bar, "+ Add rule", self.add_rule, width=120).grid(row=0, column=0, sticky="w")
@@ -930,9 +973,22 @@ class RuleEditor(ctk.CTkFrame):
         t.ghost_button(bar, "Find and replace…", self.open_find_dialog, width=140).grid(
             row=0, column=2, sticky="w", padx=(8, 0))
 
-        # Learn prompts and "Copied 3 rules"-style notes.
+        # Filter and compact view, for big configs.
+        self._filter = ctk.CTkEntry(bar, width=140, height=30, corner_radius=t.RADIUS,
+                                    fg_color=t.SURFACE_3, border_color=t.BORDER, font=t.font(12),
+                                    placeholder_text="Filter rules")
+        self._filter.grid(row=0, column=4, sticky="e", padx=(12, 0))
+        self._filter.bind("<KeyRelease>", lambda _e: self._schedule_filter())
+        self._filter.bind("<Escape>", lambda _e: self.clear_filter())
+        self._filter_after: str | None = None
+        self.compact = False
+        self._compact_btn = t.ghost_button(bar, "Compact", self.toggle_compact, width=86)
+        self._compact_btn.grid(row=0, column=5, sticky="e", padx=(8, 0))
+        bar.bind("<Configure>", lambda _e: self._fit_bar(), add="+")
+
+        # Learn prompts and "Copied 3 rules"-style notes get a row of their
+        # own, shown only while there is something to say.
         self._hint = ctk.CTkLabel(bar, text="", font=t.font(12), text_color=t.ACCENT, anchor="w")
-        self._hint.grid(row=0, column=3, sticky="w", padx=(12, 4))
         self._hint_after: str | None = None
 
         # Delete is instant; the safety net is Undo, offered here for a few
@@ -948,7 +1004,7 @@ class RuleEditor(ctk.CTkFrame):
         self._undo_after: str | None = None
 
         self._count = ctk.CTkLabel(bar, text="", font=t.font(12), text_color=t.TEXT_MUTED, anchor="e")
-        self._count.grid(row=0, column=5, sticky="e", padx=(12, 4))
+        self._count.grid(row=0, column=6, sticky="e", padx=(12, 4))
 
         self._history = History()
         self._edit_after: str | None = None
@@ -990,6 +1046,7 @@ class RuleEditor(ctk.CTkFrame):
 
         self._model = RuleList()
         self._cards: list[RuleCard] = []
+        self._shown = 0   # cards the filter leaves visible
         # Side panel hooks: told which rule the mouse is over (None when none).
         self.hover_listener: Callable[[Rule | None], None] | None = None
         self._hover_card: RuleCard | None = None
@@ -1080,6 +1137,7 @@ class RuleEditor(ctk.CTkFrame):
         self._selection.clear()
         self._anchor = None
         self._cancel_edit_commit()
+        self._filter.delete(0, "end")
         self._errors = {}
         self._model = RuleList(rules)
         self._history.reset(self._model.rules)
@@ -1124,6 +1182,9 @@ class RuleEditor(ctk.CTkFrame):
         if not (0 <= index < len(self._cards)):
             return
         card = self._cards[index]
+        if not self._visible(card):
+            self.clear_filter()
+        card.set_compact(False)
         self._scroll_to(card)
         if field:
             card.focus_field(field)
@@ -1175,6 +1236,7 @@ class RuleEditor(ctk.CTkFrame):
             if errs:
                 card.set_errors(errs)
             n -= 1
+        self._shown = len(self._cards)   # a config load starts unfiltered
         self._sync_empty()
 
     def _schedule_build(self):
@@ -1204,17 +1266,85 @@ class RuleEditor(ctk.CTkFrame):
                 self._build_after = None
             self._build_some(len(self._build_pending))
 
+    # ------------------------------------------------------ filter, compact
+
+    def _schedule_filter(self):
+        if self._filter_after is not None:
+            self.after_cancel(self._filter_after)
+        self._filter_after = self.after(FILTER_DELAY_MS, self._refilter)
+
+    def clear_filter(self):
+        if self._filter.get():
+            self._filter.delete(0, "end")
+            self._refilter()
+        return "break"
+
+    def _refilter(self, show: set | None = None):
+        """Hide the cards that don't match the filter. Rows keep their list
+        index, so showing a card again needs no regrid of the others."""
+        self._filter_after = None
+        self._flush_build()
+        text = self._filter.get().strip()
+        show = show or set()
+        shown = 0
+        for i, card in enumerate(self._cards):
+            visible = (card in show
+                       or rule_matches(card.rule, text, RULE_TYPE_LABELS.get(card.rule.type, "")))
+            if visible:
+                shown += 1
+                if not card.winfo_manager():
+                    card.grid(row=i, column=0, sticky="ew", padx=4, pady=3)
+            elif card.winfo_manager():
+                card.grid_remove()
+        self._shown = shown
+        # Selected cards the filter hides would be edited unseen.
+        hidden = {c for c in self._selection if not c.winfo_manager()}
+        if hidden:
+            self._set_selection(self._selection - hidden)
+        self._sync_empty()
+        self._update_count()
+
+    def _visible(self, card: RuleCard) -> bool:
+        return bool(card.winfo_manager())
+
+    def toggle_compact(self):
+        self._flush_build()
+        self.compact = not self.compact
+        for card in self._cards:
+            card.set_compact(self.compact)
+        self._compact_btn.configure(fg_color=t.ACCENT_SOFT if self.compact else "transparent",
+                                    text_color=t.ACCENT if self.compact else t.TEXT)
+
+    def _fit_bar(self):
+        """In a narrow window the rule count gives way to the controls."""
+        wide = self._bar.winfo_width() >= t.px(self, COUNT_MIN_W)
+        if wide and not self._count.winfo_manager():
+            self._count.grid()
+        elif not wide and self._count.winfo_manager():
+            self._count.grid_remove()
+
     def _sync_empty(self):
-        if self._model.rules:
-            self._empty.grid_remove()
-        else:
+        text = self._filter.get().strip()
+        if not self._model.rules:
+            self._empty.configure(text="No rules yet. Add a rule to map a pin to a button or axis.")
             self._empty.grid()
+        elif text and self._shown == 0:
+            self._empty.configure(text=f"No rules match “{text}”. Esc in the filter clears it.")
+            self._empty.grid()
+        else:
+            self._empty.grid_remove()
 
     def _update_count(self):
         n = len(self._model)
         total = f"{n} rule" if n == 1 else f"{n} rules"
         k = len(self._selection)
-        self._count.configure(text=f"{k} of {total} selected" if k else total)
+        if k:
+            text = f"{k} of {total} selected"
+        elif self._filter.get().strip():
+            text = f"{self._shown} of {total} shown"
+        else:
+            text = total
+        self._count.configure(text=text)
 
     def _changed(self):
         self._sync_empty()
@@ -1316,6 +1446,10 @@ class RuleEditor(ctk.CTkFrame):
             self.after_cancel(self._hint_after)
             self._hint_after = None
         self._hint.configure(text=text)
+        if text:
+            self._hint.grid(row=1, column=0, columnspan=4, sticky="w", padx=(4, 4), pady=(6, 0))
+        else:
+            self._hint.grid_remove()
         if text and clear_after_ms:
             self._hint_after = self.after(clear_after_ms, lambda: self._show_hint("", None))
 
@@ -1335,12 +1469,14 @@ class RuleEditor(ctk.CTkFrame):
         pre, suf = diff_span(self._model.rules, rules)
         pool = old_cards[pre:old_n - suf]
         middle: list[RuleCard] = []
+        created: list[RuleCard] = []
         for rule in rules[pre:len(rules) - suf]:
             card = next((c for c in pool if c.rule == rule), None)
             if card is not None:
                 pool.remove(card)
             else:
                 card = RuleCard(self.scroll, self, rule.copy())
+                created.append(card)
             middle.append(card)
         for card in pool:
             self._drop_card(card)
@@ -1357,6 +1493,11 @@ class RuleEditor(ctk.CTkFrame):
             self._history.commit(self._model.rules)
         if select is not None:
             self._set_selection([self._cards[i] for i in select if 0 <= i < len(self._cards)])
+        if self._filter.get().strip():
+            # New and selected rules stay in view even when they don't match.
+            self._refilter(show=set(created) | self._selection)
+        else:
+            self._shown = len(self._cards)
         self._changed()
         if focus is not None and 0 <= focus < len(self._cards):
             card = self._cards[focus]
@@ -1408,10 +1549,12 @@ class RuleEditor(ctk.CTkFrame):
             self._show_hint(nothing, 1500)
             return
         self._dismiss_undo()
-        before = self._model.rules
-        pre, suf = diff_span(before, rules)
-        changed = list(range(pre, len(rules) - suf))
-        self._apply(rules, select=changed, record=False)
+        pre, _ = diff_span(self._model.rules, rules)
+        # No selection afterwards: Ctrl+Z then Delete must never hit a block
+        # of rules the undo happened to touch. Just bring the change into view.
+        self._apply(rules, select=[], record=False)
+        if self._cards:
+            self._scroll_to(self._cards[min(pre, len(self._cards) - 1)])
 
     # ---------------------------------------------------------- selection
 
@@ -1437,7 +1580,7 @@ class RuleEditor(ctk.CTkFrame):
         Shift+click: everything from the last clicked card to this one."""
         if state & SHIFT and self._anchor in self._cards:
             a, b = sorted((self.index_of(self._anchor), self.index_of(card)))
-            span = self._cards[a:b + 1]
+            span = [c for c in self._cards[a:b + 1] if self._visible(c)]
             self._set_selection(self._selection | set(span) if state & CONTROL else span)
         elif state & CONTROL:
             self._anchor = card
@@ -1449,7 +1592,7 @@ class RuleEditor(ctk.CTkFrame):
 
     def select_all(self):
         self._flush_build()
-        self._set_selection(self._cards)
+        self._set_selection([c for c in self._cards if self._visible(c)])
 
     def clear_selection(self):
         if self._selection:
@@ -1523,7 +1666,7 @@ class RuleEditor(ctk.CTkFrame):
 
     def _offer_undo(self, text: str):
         self._undo_label.configure(text=text)
-        self._undo_bar.grid(row=0, column=4, sticky="e", padx=(12, 0))
+        self._undo_bar.grid(row=1, column=4, columnspan=3, sticky="e", pady=(6, 0))
         if self._undo_after is not None:
             self.after_cancel(self._undo_after)
         self._undo_after = self.after(UNDO_WINDOW_MS, self._dismiss_undo)
@@ -1703,18 +1846,22 @@ class RuleEditor(ctk.CTkFrame):
         """Insertion gap index for a pointer y: 0 = before the first card,
         len = after the last. Root coordinates, so window scaling is moot."""
         for i, c in enumerate(self._cards):
+            if not self._visible(c):
+                continue
             top = c.winfo_rooty()
             if y_root < top + c.winfo_height() / 2:
                 return i
         return len(self._cards)
 
     def _show_indicator(self, gap: int):
-        if not self._cards:
+        visible = [c for c in self._cards if self._visible(c)]
+        if not visible:
             return
-        if gap < len(self._cards):
-            y = self._cards[gap].winfo_y() - 3
+        after = next((c for c in self._cards[gap:] if self._visible(c)), None)
+        if after is not None:
+            y = after.winfo_y() - 3
         else:
-            last = self._cards[-1]
+            last = visible[-1]
             y = last.winfo_y() + last.winfo_height() + 1
         self._indicator.place(x=4, y=max(0, y), relwidth=1.0, width=-8)
         self._indicator.lift()
