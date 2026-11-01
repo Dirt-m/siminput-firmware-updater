@@ -79,10 +79,27 @@ class RuleList:
                     used.add(ref)
         return used
 
-    def new_rule(self, pins: list[str] | None = None) -> Rule:
+    def pin_usage(self) -> dict[str, list[int]]:
+        """Each name a rule reads → indices of the rules reading it."""
+        usage: dict[str, list[int]] = {}
+        for i, r in enumerate(self.rules):
+            for name in rule_inputs(r):
+                usage.setdefault(name, []).append(i)
+        return usage
+
+    def button_usage(self) -> dict[int, list[int]]:
+        """HID button number → indices of the rules that drive it."""
+        usage: dict[int, list[int]] = {}
+        for i, r in enumerate(self.rules):
+            for n in rule_buttons(r):
+                usage.setdefault(n, []).append(i)
+        return usage
+
+    def new_rule(self, pins: list[str] | None = None, input_pin: str | None = None) -> Rule:
         """A Direct Map on the next unused pin and button, continuing from the
-        last rule so a run of Add clicks walks D1→B1, D2→B2, … without edits."""
-        pins = sorted(pins or ALL_KNOWN_PINS, key=_pin_order)
+        last rule so a run of Add clicks walks D1→B1, D2→B2, … without edits.
+        `input_pin` fixes the input instead (the side panel's click on a free pin)."""
+        pins = sorted(pins or ALL_KNOWN_PINS, key=pin_order)
         last = next((r for r in reversed(self.rules) if not r.comment), None)
         last_input = last.input if last and last.input in pins else None
         last_output = None
@@ -90,12 +107,35 @@ class RuleList:
             for ref in (last.output, last.cw, last.ccw):
                 if ref and _B_PATTERN.match(ref):
                     last_output = ref
-        inp = next_free(pins, self.used_inputs(), after=last_input) or ""
+        inp = input_pin or next_free(pins, self.used_inputs(), after=last_input) or ""
         out = next_free(BUTTON_REFS, self.used_outputs(), after=last_output) or ""
         return Rule(type="MAP", input=inp, output=out)
 
 
-def _pin_order(p: str):
+def rule_inputs(rule: Rule) -> set[str]:
+    """Names a rule reads: pins, and also variables or outputs of earlier
+    rules (callers that want pins intersect with the board's pin list)."""
+    if rule.comment:
+        return set()
+    names = {x for x in rule.inputs if x}
+    if rule.input:
+        names.add(rule.input)
+    return names
+
+
+def rule_buttons(rule: Rule) -> set[int]:
+    """HID buttons (1-127) a rule drives through output, cw or ccw."""
+    if rule.comment:
+        return set()
+    found = set()
+    for ref in (rule.output, rule.cw, rule.ccw):
+        m = _B_PATTERN.match(ref or "")
+        if m and 1 <= int(m.group(1)) <= 127:
+            found.add(int(m.group(1)))
+    return found
+
+
+def pin_order(p: str):
     """Digital pins first (that's where switches live), then the rest, each
     group in natural numeric order."""
     kind, letters, num = _pin_sort_key(p)
