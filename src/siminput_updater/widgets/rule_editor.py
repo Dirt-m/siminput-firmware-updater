@@ -7,6 +7,11 @@ Design notes (these are what keep the list fast — keep them true):
   involved. Nothing rebuilds the whole list except a config load.
 * A card resolves its own position with `editor.index_of(self)` at click
   time. Never bake an index into a callback — cards outlive reorders.
+* Every change to the list (add, delete, move, paste, bulk edits, undo)
+  is computed on plain rules and handed to `RuleEditor._apply`, which keeps
+  the cards at both ends that still match and rebuilds only the middle, so a
+  move or an undo costs what the one-card operations do. `History` takes a
+  snapshot after each, and after a pause in typing.
 * Card chrome (handle, number, captions, glyph buttons, the type picker) is
   plain tk. customtkinter widgets each cost a canvas plus a draw engine, so
   they are used only where the user types or toggles. Plain-tk colours are
@@ -24,9 +29,13 @@ import customtkinter as ctk
 from .. import ui_theme as t
 from ..config_model import (
     ANALOG_HYSTERESIS_DEFAULT, ANALOG_MAX, ANALOG_RULE_TYPES, RULE_TYPE_LABELS,
-    THRESHOLD_HYSTERESIS_DEFAULT, Rule, _pin_sort_key, analog_pins_for_board,
+    ALL_KNOWN_PINS, THRESHOLD_HYSTERESIS_DEFAULT, Rule, _pin_sort_key, analog_pins_for_board,
+    pins_for_board,
 )
-from ..rule_list import RuleList, rule_inputs
+from ..rule_list import (
+    History, RuleList, diff_span, insert_rules, move_to_gap, nudge, remove_indices,
+    rule_inputs, rules_from_text, rules_to_text,
+)
 from .calibrate_dialog import CalibrateDialog
 
 if TYPE_CHECKING:
@@ -45,6 +54,8 @@ SYNC_BUILD_COUNT = 12   # cards built before the first paint on a config load
 BUILD_CHUNK = 6         # cards per idle callback after that
 AUTOSCROLL_MARGIN = 28  # px from the viewport edge that starts auto-scroll
 UNDO_WINDOW_MS = 10000  # how long "Undo" stays offered after a delete
+EDIT_COMMIT_MS = 700    # a pause in typing this long ends one undo step
+SHIFT, CONTROL = 0x1, 0x4   # event.state bits
 
 
 def _opt_int(text: str):
@@ -218,6 +229,7 @@ class RuleCard(tk.Frame):
         self._tips: dict[int, str] = {}   # id(widget) → message shown on hover
         self._learn_glyphs: dict[str, Glyph] = {}
         self._live = False    # reads a pin that is pressed on the box right now
+        self._selected = False
         self._plain: list[tk.Widget] = []     # plain-tk children to retheme
         self._ctk_children: list = []          # CTk children needing bg_color sync
         self._rows: list[tk.Frame] = []
@@ -236,7 +248,7 @@ class RuleCard(tk.Frame):
         self.bind("<Leave>", lambda _e: editor.card_hover(self, False), add="+")
 
         # -- left rail: drag handle + number --
-        rail = tk.Frame(self, bg=bg)
+        rail = self.rail = tk.Frame(self, bg=bg)
         rail.grid(row=0, column=0, rowspan=2, sticky="ns", padx=(6, 4), pady=6)
         self._plain.append(rail)
         self.handle = tk.Label(rail, text=HANDLE_GLYPH, cursor="fleur", padx=2, bg=bg,
@@ -248,7 +260,7 @@ class RuleCard(tk.Frame):
         for w in (self.handle, self.num):
             w.bind("<ButtonPress-1>", self._drag_start)
             w.bind("<B1-Motion>", self._drag_motion)
-            w.bind("<ButtonRelease-1>", self._drag_end)
+            w.bind("<ButtonRelease-1>", lambda e: self._drag_end(e))
             w.bind("<Button-3>", self._context_menu)
             w.bind("<Button-2>", self._context_menu)
 
@@ -285,9 +297,19 @@ class RuleCard(tk.Frame):
         Glyph(actions, DELETE_GLYPH, self._delete, t.ERROR, t.ERROR_SOFT, bg).pack(side="left")
         self._glyphs += [w for w in actions.winfo_children()]
 
+        # A click on the card's background (not a field) selects it.
+        for w in (self, rail, self.body, actions):
+            self._selectable(w)
+        if not rule.comment:
+            self._selectable(self.fields)
+
+    def _selectable(self, widget):
+        widget.bind("<Button-1>", lambda e: self.editor.click_select(self, e.state), add="+")
+
     def _caption(self, parent, text: str, **kw) -> tk.Label:
         lbl = tk.Label(parent, text=text, bg=self._bg, fg=self._dim, font=self._cap_font, **kw)
         self._plain.append(lbl)
+        self._selectable(lbl)
         return lbl
 
     # ------------------------------------------------------------- fields
@@ -385,6 +407,7 @@ class RuleCard(tk.Frame):
         row = tk.Frame(self.fields, bg=self._bg)
         row.grid(row=len(self._rows), column=0, sticky="ew", pady=(0 if not self._rows else gap, 0))
         self._rows.append(row)
+        self._selectable(row)
         return row
 
     def _field(self, row, label, builder, learn: str | None = None):
@@ -412,6 +435,7 @@ class RuleCard(tk.Frame):
         row = self._row(gap=3)
         self.summary = tk.Label(row, anchor="w", bg=self._bg, fg=self._muted, font=self._cap_font)
         self.summary.pack(side="left")
+        self._selectable(self.summary)
 
     def _bind_entry(self, e):
         e.bind("<KeyRelease>", lambda _e: self._sync())
@@ -561,8 +585,7 @@ class RuleCard(tk.Frame):
                 w.configure(bg=bg)
         for row in self._rows:
             row.configure(bg=bg)
-        self.handle.configure(bg=bg, fg=self._muted)
-        self.num.configure(bg=bg)
+        self.handle.configure(fg=self._muted)
         self.set_live(self._live)
         if self.summary is not None and self.summary.winfo_exists():
             self.summary.configure(bg=bg, fg=self._muted)
@@ -573,14 +596,29 @@ class RuleCard(tk.Frame):
                 c.configure(bg_color=bg)
 
     def paint_border(self, color=None):
-        """Outline in `color`, else green while a pin it reads is pressed."""
-        c = t.resolve(color or (t.SUCCESS if self._live else t.BORDER))
+        """Outline in `color`, else accent while selected, else green while a
+        pin it reads is pressed."""
+        c = t.resolve(color or (t.ACCENT if self._selected else t.SUCCESS if self._live else t.BORDER))
         self.configure(highlightbackground=c, highlightcolor=c)
 
     def set_live(self, on: bool):
         self._live = on
+        self._paint_rail()
+
+    def set_selected(self, on: bool):
+        if on != self._selected:
+            self._selected = on
+            self._paint_rail()
+
+    def _paint_rail(self):
+        """The rail carries both states: tinted when selected, a green
+        number while live. Only three widgets, so selecting is cheap."""
+        rail_bg = t.resolve(t.ACCENT_SOFT) if self._selected else self._bg
+        for w in (self.rail, self.handle, self.num):
+            w.configure(bg=rail_bg)
+        self.num.configure(fg=t.resolve(t.SUCCESS) if self._live
+                           else t.resolve(t.ACCENT) if self._selected else self._muted)
         self.paint_border()
-        self.num.configure(fg=t.resolve(t.SUCCESS) if on else self._muted)
 
     def set_number(self, n: int):
         self.num.configure(text=str(n))
@@ -605,6 +643,7 @@ class RuleCard(tk.Frame):
         self._apply_edits()
         self._sync_summary()
         self.editor.page._mark_dirty()
+        self.editor.note_edit()
 
     def _sync_summary(self):
         if self.summary is not None and self.summary.winfo_exists() and not self.rule.comment:
@@ -788,31 +827,43 @@ class RuleCard(tk.Frame):
         self.editor.remove_card(self)
 
     def _nudge(self, delta: int):
-        i = self.editor.index_of(self)
-        self.editor.move_card(self, i + delta)
+        self.editor.nudge_card(self, delta)
         return "break"
 
     def _context_menu(self, event):
-        i = self.editor.index_of(self)
-        last = len(self.editor) - 1
+        """Acts on the whole selection when this card is part of it."""
+        ed = self.editor
+        if not self._selected:
+            ed.select_only(self)
+        idx = ed.selected_indices()
+        n, last = len(idx), len(ed) - 1
+        what = f"{n} rules" if n > 1 else "rule"
         menu = tk.Menu(
             self, tearoff=0, relief="flat", borderwidth=0,
             bg=t.resolve(t.SURFACE_2), fg=t.resolve(t.TEXT),
             activebackground=t.resolve(t.HOVER), activeforeground=t.resolve(t.TEXT),
             disabledforeground=t.resolve(t.TEXT_MUTED), font=t.tk_font(self, 12),
         )
-        menu.add_command(label="Move up", accelerator="Alt+↑", command=lambda: self._nudge(-1),
-                         state="normal" if i > 0 else "disabled")
-        menu.add_command(label="Move down", accelerator="Alt+↓", command=lambda: self._nudge(1),
-                         state="normal" if i < last else "disabled")
-        menu.add_command(label="Move to top", command=lambda: self.editor.move_card(self, 0),
-                         state="normal" if i > 0 else "disabled")
-        menu.add_command(label="Move to bottom", command=lambda: self.editor.move_card(self, last),
-                         state="normal" if i < last else "disabled")
-        menu.add_command(label="Move to position…", command=self._move_to_prompt)
+        top, bottom = idx[0] > 0, idx[-1] < last or idx[-1] - idx[0] + 1 != n
+        menu.add_command(label="Move up", accelerator="Alt+↑", command=lambda: ed.nudge_selection(-1),
+                         state="normal" if top else "disabled")
+        menu.add_command(label="Move down", accelerator="Alt+↓", command=lambda: ed.nudge_selection(1),
+                         state="normal" if bottom else "disabled")
+        menu.add_command(label="Move to top", command=lambda: ed.move_selection_to(0),
+                         state="normal" if top else "disabled")
+        menu.add_command(label="Move to bottom", command=lambda: ed.move_selection_to(last + 1),
+                         state="normal" if bottom else "disabled")
+        menu.add_command(label="Move to position…", command=self._move_to_prompt,
+                         state="normal" if n == 1 else "disabled")
         menu.add_separator()
-        menu.add_command(label="Duplicate", command=self._duplicate)
-        menu.add_command(label="Delete", command=self._delete)
+        menu.add_command(label=f"Duplicate {what}", accelerator="Ctrl+D", command=ed.duplicate_selection)
+        menu.add_command(label="Duplicate with offset…", command=ed.open_offset_dialog)
+        menu.add_command(label=f"Copy {what}", accelerator="Ctrl+C", command=ed.copy_selection)
+        menu.add_command(label="Paste below", accelerator="Ctrl+V", command=ed.paste)
+        menu.add_command(label="Find and replace…", accelerator="Ctrl+H", command=ed.open_find_dialog)
+        menu.add_separator()
+        menu.add_command(label="Select all", accelerator="Ctrl+A", command=ed.select_all)
+        menu.add_command(label=f"Delete {what}", accelerator="Del", command=ed.delete_selection)
         _popup(menu, event.x_root, event.y_root)
 
     def _move_to_prompt(self):
@@ -837,7 +888,7 @@ class RuleCard(tk.Frame):
         self.editor.drag_update(event.y_root)
 
     def _drag_end(self, event):
-        self.editor.drag_finish(event.y_root)
+        self.editor.drag_finish(event.y_root, event.state)
 
 
 class RuleEditor(ctk.CTkFrame):
@@ -850,37 +901,70 @@ class RuleEditor(ctk.CTkFrame):
         # Top bar: the primary action lives here, never below the fold.
         bar = ctk.CTkFrame(self, fg_color="transparent")
         bar.grid(row=0, column=0, sticky="ew", padx=4, pady=(0, 8))
-        bar.grid_columnconfigure(1, weight=1)
+        bar.grid_columnconfigure(3, weight=1)
         t.primary_button(bar, "+ Add rule", self.add_rule, width=120).grid(row=0, column=0, sticky="w")
-        self._count = ctk.CTkLabel(bar, text="", font=t.font(12), text_color=t.TEXT_MUTED, anchor="e")
-        self._count.grid(row=0, column=1, sticky="e", padx=(12, 4))
+        t.ghost_button(bar, "Add range…", self.open_range_dialog, width=104).grid(
+            row=0, column=1, sticky="w", padx=(8, 0))
+        t.ghost_button(bar, "Find and replace…", self.open_find_dialog, width=140).grid(
+            row=0, column=2, sticky="w", padx=(8, 0))
 
-        # Delete is instant; the safety net is a one-shot Undo offered here
-        # for a few seconds (and on Ctrl+Z) instead of a confirm dialog.
+        # Learn prompts and "Copied 3 rules"-style notes.
+        self._hint = ctk.CTkLabel(bar, text="", font=t.font(12), text_color=t.ACCENT, anchor="w")
+        self._hint.grid(row=0, column=3, sticky="w", padx=(12, 4))
+        self._hint_after: str | None = None
+
+        # Delete is instant; the safety net is Undo, offered here for a few
+        # seconds after a delete (and always on Ctrl+Z) instead of a confirm.
         self._undo_bar = ctk.CTkFrame(bar, fg_color=t.SURFACE_2, corner_radius=t.RADIUS)
         self._undo_label = ctk.CTkLabel(self._undo_bar, text="", font=t.font(12), text_color=t.TEXT_DIM)
         self._undo_label.grid(row=0, column=0, padx=(12, 6), pady=4)
         self._undo_btn = ctk.CTkButton(
             self._undo_bar, text="Undo", width=56, height=24, corner_radius=t.RADIUS,
             fg_color="transparent", hover_color=t.HOVER, text_color=t.ACCENT,
-            font=t.font(12, "bold"), command=self.undo_delete)
+            font=t.font(12, "bold"), command=self.undo)
         self._undo_btn.grid(row=0, column=1, padx=(0, 6), pady=4)
-        self._undo: tuple[int, Rule] | None = None
         self._undo_after: str | None = None
-        self.winfo_toplevel().bind("<Control-z>", lambda _e: self.undo_delete(), add="+")
+
+        self._count = ctk.CTkLabel(bar, text="", font=t.font(12), text_color=t.TEXT_MUTED, anchor="e")
+        self._count.grid(row=0, column=5, sticky="e", padx=(12, 4))
+
+        self._history = History()
+        self._edit_after: str | None = None
 
         # Learn mode: one (card, field) waiting for the next pin press.
-        self._hint = ctk.CTkLabel(bar, text="", font=t.font(12), text_color=t.ACCENT, anchor="w")
-        self._hint.grid(row=0, column=3, sticky="w", padx=(12, 4))
         self._learn: tuple[RuleCard, str] | None = None
         self._learn_baseline: dict[str, int] | None = None
         self._learn_after: str | None = None
-        self._hint_after: str | None = None
-        self.winfo_toplevel().bind("<Escape>", lambda _e: self.cancel_learn(), add="+")
+
+        # Selection: cards, not indices, so it survives reorders.
+        self._selection: set[RuleCard] = set()
+        self._anchor: RuleCard | None = None
+        self._dialog = None
+
+        top = self.winfo_toplevel()
+        keys = {
+            "<Control-z>": self.undo, "<Control-Z>": self.redo, "<Control-y>": self.redo,
+            "<Control-c>": self.copy_selection, "<Control-v>": self.paste,
+            "<Control-d>": self.duplicate_selection, "<Control-a>": self.select_all,
+            "<Control-h>": self.open_find_dialog, "<Delete>": self.delete_selection,
+            "<Alt-Up>": lambda: self.nudge_selection(-1), "<Alt-Down>": lambda: self.nudge_selection(1),
+            "<Escape>": self._escape,
+        }
+        # Undo and redo work while typing too (an entry has no undo of its
+        # own); the rest leave a focused text field alone.
+        always = {"<Control-z>", "<Control-Z>", "<Control-y>", "<Escape>"}
+        for seq, fn in keys.items():
+            top.bind(seq, lambda e, fn=fn, a=seq in always: self._on_key(e, fn, a), add="+")
+        # Tk's Entry binds Ctrl+H to backspace, and class bindings run before
+        # the window's; take it over so Find works from inside a field too.
+        self.bind_class("Entry", "<Control-h>", self._entry_ctrl_h)
 
         self.scroll = ctk.CTkScrollableFrame(self, fg_color="transparent")
         self.scroll.grid(row=1, column=0, sticky="nsew")
         self.scroll.grid_columnconfigure(0, weight=1)
+        # A click on the empty space below the cards clears the selection.
+        for w in (self.scroll, self.scroll._parent_canvas):
+            w.bind("<Button-1>", lambda _e: self.clear_selection(), add="+")
 
         self._model = RuleList()
         self._cards: list[RuleCard] = []
@@ -971,8 +1055,12 @@ class RuleEditor(ctk.CTkFrame):
         for card in self._cards:
             card.destroy()
         self._cards.clear()
+        self._selection.clear()
+        self._anchor = None
+        self._cancel_edit_commit()
         self._errors = {}
         self._model = RuleList(rules)
+        self._history.reset(self._model.rules)
         self._build_pending = list(self._model.rules)
         self._build_some(SYNC_BUILD_COUNT)
         self._schedule_build()
@@ -1058,7 +1146,9 @@ class RuleEditor(ctk.CTkFrame):
         while self._build_pending and n > 0:
             rule = self._build_pending.pop(0)
             card = RuleCard(self.scroll, self, rule)
-            self._place_card(card, len(self._cards))
+            card.grid(row=len(self._cards), column=0, sticky="ew", padx=4, pady=3)
+            card.set_number(len(self._cards) + 1)
+            self._cards.append(card)
             errs = self._errors.get(len(self._cards) - 1)
             if errs:
                 card.set_errors(errs)
@@ -1092,21 +1182,6 @@ class RuleEditor(ctk.CTkFrame):
                 self._build_after = None
             self._build_some(len(self._build_pending))
 
-    def _place_card(self, card: RuleCard, index: int):
-        self._cards.insert(index, card)
-        card.grid(row=index, column=0, sticky="ew", padx=4, pady=3)
-        self._regrid(index + 1)
-        self._renumber(index)
-
-    def _regrid(self, start: int, end: int | None = None):
-        end = len(self._cards) if end is None else end
-        for i in range(start, end):
-            self._cards[i].grid_configure(row=i)
-
-    def _renumber(self, start: int = 0):
-        for i in range(start, len(self._cards)):
-            self._cards[i].set_number(i + 1)
-
     def _sync_empty(self):
         if self._model.rules:
             self._empty.grid_remove()
@@ -1115,7 +1190,9 @@ class RuleEditor(ctk.CTkFrame):
 
     def _update_count(self):
         n = len(self._model)
-        self._count.configure(text=f"{n} rule" if n == 1 else f"{n} rules")
+        total = f"{n} rule" if n == 1 else f"{n} rules"
+        k = len(self._selection)
+        self._count.configure(text=f"{k} of {total} selected" if k else total)
 
     def _changed(self):
         self._sync_empty()
@@ -1220,97 +1297,343 @@ class RuleEditor(ctk.CTkFrame):
         if text and clear_after_ms:
             self._hint_after = self.after(clear_after_ms, lambda: self._show_hint("", None))
 
+    # ----------------------------------------------------------- applying
+
+    def _apply(self, rules: list[Rule], select: list[int] | None = None,
+               focus: int | None = None, record: bool = True):
+        """Make the cards show `rules`. Cards at both ends that still match
+        stay; in the middle, a card whose rule is unchanged is reused (a move
+        just regrids it) and only the rest are built. `select` picks the
+        cards selected afterwards (None keeps the current selection)."""
+        self._flush_build()
+        if record:
+            self._commit_edit()
+        old_cards = self._cards
+        old_n = len(old_cards)
+        pre, suf = diff_span(self._model.rules, rules)
+        pool = old_cards[pre:old_n - suf]
+        middle: list[RuleCard] = []
+        for rule in rules[pre:len(rules) - suf]:
+            card = next((c for c in pool if c.rule == rule), None)
+            if card is not None:
+                pool.remove(card)
+            else:
+                card = RuleCard(self.scroll, self, rule.copy())
+            middle.append(card)
+        for card in pool:
+            self._drop_card(card)
+        self._cards = old_cards[:pre] + middle + old_cards[old_n - suf:]
+        self._model.rules = [c.rule for c in self._cards]
+        for i in range(pre, len(self._cards)):
+            card = self._cards[i]
+            if card.winfo_manager():
+                card.grid_configure(row=i)
+            else:
+                card.grid(row=i, column=0, sticky="ew", padx=4, pady=3)
+            card.set_number(i + 1)
+        if record:
+            self._history.commit(self._model.rules)
+        if select is not None:
+            self._set_selection([self._cards[i] for i in select if 0 <= i < len(self._cards)])
+        self._changed()
+        if focus is not None and 0 <= focus < len(self._cards):
+            card = self._cards[focus]
+            self._scroll_to(card)
+            card.focus_first()
+        elif select:
+            self._scroll_to(self._cards[min(select[-1], len(self._cards) - 1)])
+
+    def _drop_card(self, card: RuleCard):
+        if self._learn and self._learn[0] is card:
+            self.cancel_learn()
+        if self._hover_card is card:
+            self._set_hover(None)
+        self._selection.discard(card)
+        if self._anchor is card:
+            self._anchor = None
+        card.destroy()
+
+    def _rules(self) -> list[Rule]:
+        return list(self._model.rules)
+
+    # ------------------------------------------------------------ history
+
+    def note_edit(self):
+        """A field changed. Typing is grouped: the undo step closes after a
+        short pause, or as soon as anything else happens."""
+        self._cancel_edit_commit()
+        self._edit_after = self.after(EDIT_COMMIT_MS, self._commit_edit)
+
+    def _cancel_edit_commit(self):
+        if self._edit_after is not None:
+            self.after_cancel(self._edit_after)
+            self._edit_after = None
+
+    def _commit_edit(self):
+        self._cancel_edit_commit()
+        self._history.commit(self._model.rules)
+
+    def undo(self):
+        self._commit_edit()
+        self._time_travel(self._history.undo(), "Nothing to undo")
+
+    def redo(self):
+        self._commit_edit()
+        self._time_travel(self._history.redo(), "Nothing to redo")
+
+    def _time_travel(self, rules: list[Rule] | None, nothing: str):
+        if rules is None:
+            self._show_hint(nothing, 1500)
+            return
+        self._dismiss_undo()
+        before = self._model.rules
+        pre, suf = diff_span(before, rules)
+        changed = list(range(pre, len(rules) - suf))
+        self._apply(rules, select=changed, record=False)
+
+    # ---------------------------------------------------------- selection
+
+    def selected_indices(self) -> list[int]:
+        return sorted(self.index_of(c) for c in self._selection)
+
+    def _set_selection(self, cards):
+        cards = set(cards)
+        for c in self._selection - cards:
+            if c.winfo_exists():
+                c.set_selected(False)
+        for c in cards - self._selection:
+            c.set_selected(True)
+        self._selection = cards
+        self._update_count()
+
+    def select_only(self, card: RuleCard):
+        self._anchor = card
+        self._set_selection([card])
+
+    def click_select(self, card: RuleCard, state: int = 0):
+        """Click: select this card. Ctrl+click: add or remove it.
+        Shift+click: everything from the last clicked card to this one."""
+        if state & SHIFT and self._anchor in self._cards:
+            a, b = sorted((self.index_of(self._anchor), self.index_of(card)))
+            span = self._cards[a:b + 1]
+            self._set_selection(self._selection | set(span) if state & CONTROL else span)
+        elif state & CONTROL:
+            self._anchor = card
+            self._set_selection(self._selection ^ {card})
+        else:
+            self.select_only(card)
+        # Keyboard shortcuts act on the selection once focus leaves the fields.
+        card.focus_set()
+
+    def select_all(self):
+        self._flush_build()
+        self._set_selection(self._cards)
+
+    def clear_selection(self):
+        if self._selection:
+            self._set_selection([])
+
+    def _escape(self):
+        if self._learn is not None:
+            self.cancel_learn()
+        else:
+            self.clear_selection()
+
+    def _target(self, card: RuleCard | None = None) -> list[int]:
+        """The selection when `card` is part of it (or no card is given),
+        else just `card`."""
+        if card is not None and card not in self._selection:
+            return [self.index_of(card)]
+        return self.selected_indices()
+
+    # ----------------------------------------------------------- keyboard
+
+    def _on_key(self, event, fn, always: bool):
+        if not self.winfo_viewable():
+            return None
+        if not always and isinstance(self.focus_get(), (tk.Entry, tk.Text)):
+            return None
+        fn()
+        return "break"
+
+    def _entry_ctrl_h(self, _event):
+        if self.winfo_viewable() and not self._dialog_open():
+            self.open_find_dialog()
+        return "break"
+
+    def _dialog_open(self) -> bool:
+        return self._dialog is not None and self._dialog.winfo_exists()
+
     # --------------------------------------------------------- operations
 
     def add_rule(self, input_pin: str | None = None):
         self._flush_build()
         rule = self._model.new_rule(self.device_pins(), input_pin=input_pin)
-        index = self._model.append(rule)
-        card = RuleCard(self.scroll, self, rule)
-        self._place_card(card, index)
-        self._changed()
-        self._scroll_to(card)
-        card.focus_first()
+        n = len(self._model)
+        self._apply(self._rules() + [rule], select=[], focus=n)
 
     def duplicate_card(self, card: RuleCard):
-        self._flush_build()
-        src = self.index_of(card)
-        card._apply_edits()
-        index = self._model.duplicate(src)
-        new = RuleCard(self.scroll, self, self._model[index])
-        self._place_card(new, index)
-        self._changed()
-        self._scroll_to(new)
-        new.focus_first()
+        self._duplicate(self._target(card))
+
+    def duplicate_selection(self):
+        self._duplicate(self.selected_indices())
+
+    def _duplicate(self, idx: list[int]):
+        """Copies of the rules go right below the last of them, selected."""
+        if not idx:
+            return
+        rules = self._rules()
+        copies = [rules[i].copy() for i in idx]
+        new, sel = insert_rules(rules, idx[-1] + 1, copies)
+        self._apply(new, select=sel, focus=sel[0] if len(sel) == 1 else None)
 
     def remove_card(self, card: RuleCard):
-        if self._learn and self._learn[0] is card:
-            self.cancel_learn()
-        self._flush_build()
-        index = self.index_of(card)
-        card._apply_edits()
-        rule = self._model.remove(index)
-        self._cards.pop(index)
-        if self._hover_card is card:
-            self._set_hover(None)
-        card.destroy()
-        self._regrid(index)
-        self._renumber(index)
-        self._changed()
-        self._offer_undo(index, rule)
+        self._delete(self._target(card))
 
-    def _offer_undo(self, index: int, rule: Rule):
-        self._undo = (index, rule)
-        self._undo_label.configure(text=f"Deleted rule {index + 1}")
-        self._undo_bar.grid(row=0, column=1, sticky="e", padx=(12, 12))
-        self._count.grid_configure(column=2)
+    def delete_selection(self):
+        self._delete(self.selected_indices())
+
+    def _delete(self, idx: list[int]):
+        if not idx:
+            return
+        self._apply(remove_indices(self._rules(), idx), select=[])
+        self._offer_undo(f"Deleted rule {idx[0] + 1}" if len(idx) == 1 else f"Deleted {len(idx)} rules")
+
+    def _offer_undo(self, text: str):
+        self._undo_label.configure(text=text)
+        self._undo_bar.grid(row=0, column=4, sticky="e", padx=(12, 0))
         if self._undo_after is not None:
             self.after_cancel(self._undo_after)
         self._undo_after = self.after(UNDO_WINDOW_MS, self._dismiss_undo)
 
     def _dismiss_undo(self):
-        self._undo_after = None
-        self._undo = None
-        self._undo_bar.grid_remove()
-        self._count.grid_configure(column=1)
-
-    def undo_delete(self):
-        """Put the last deleted rule back where it was (or at the end if the
-        list is now shorter). One level: a new delete replaces the offer."""
-        if self._undo is None or not self.winfo_viewable():
-            return
-        index, rule = self._undo
         if self._undo_after is not None:
             self.after_cancel(self._undo_after)
-        self._dismiss_undo()
-        self._flush_build()
-        index = self._model.insert(index, rule)
-        card = RuleCard(self.scroll, self, rule)
-        self._place_card(card, index)
-        self._changed()
-        self._scroll_to(card)
+        self._undo_after = None
+        self._undo_bar.grid_remove()
 
     def move_card(self, card: RuleCard, dst: int):
-        self._flush_build()
+        """Move one card so it ends up at index `dst` (the old single-card API)."""
         src = self.index_of(card)
         dst = max(0, min(dst, len(self._cards) - 1))
-        if src == dst:
+        if src != dst:
+            self._move([src], dst + 1 if dst > src else dst)
+
+    def nudge_card(self, card: RuleCard, delta: int):
+        self._nudge(self._target(card), delta)
+
+    def nudge_selection(self, delta: int):
+        self._nudge(self.selected_indices(), delta)
+
+    def _nudge(self, idx: list[int], delta: int):
+        if not idx:
             return
-        self._model.move(src, dst)
-        self._cards.pop(src)
-        self._cards.insert(dst, card)
-        lo, hi = min(src, dst), max(src, dst) + 1
-        self._regrid(lo, hi)
-        self._renumber(lo)
-        self._changed()
-        self._scroll_to(card)
+        new, sel = nudge(self._rules(), idx, delta)
+        if new != self._model.rules:
+            # Moved cards are reused, so the selection and focus ride along.
+            self._apply(new)
+            self._scroll_to(self._cards[sel[0] if delta < 0 else sel[-1]])
+
+    def move_selection_to(self, gap: int):
+        self._move(self.selected_indices(), gap)
+
+    def _move(self, idx: list[int], gap: int):
+        if not idx:
+            return
+        new, sel = move_to_gap(self._rules(), idx, gap)
+        if new != self._model.rules:
+            self._apply(new)
+            self._scroll_to(self._cards[sel[0]])
+
+    # ---------------------------------------------------------- clipboard
+
+    def copy_selection(self):
+        idx = self.selected_indices()
+        if not idx:
+            return
+        self.clipboard_clear()
+        self.clipboard_append(rules_to_text([self._model[i] for i in idx]))
+        self._show_hint(f"Copied {len(idx)} rule{'s' if len(idx) > 1 else ''}", 2000)
+
+    def paste(self):
+        """Rules from the clipboard go below the selection (or at the end)."""
+        try:
+            text = self.clipboard_get()
+        except tk.TclError:
+            text = ""
+        rules = rules_from_text(text)
+        if rules is None:
+            self._show_hint("The clipboard holds no rules", 2500)
+            return
+        idx = self.selected_indices()
+        at = idx[-1] + 1 if idx else len(self._model)
+        new, sel = insert_rules(self._rules(), at, rules)
+        self._apply(new, select=sel)
+        self._show_hint(f"Pasted {len(rules)} rule{'s' if len(rules) > 1 else ''}", 2000)
+
+    # ------------------------------------------------------------ dialogs
+
+    def board_pins(self) -> list[str]:
+        try:
+            return list(self.page.app.device_pins or pins_for_board(self.page.app.board_map))
+        except Exception:
+            return list(ALL_KNOWN_PINS)
+
+    def is_pin(self, name: str) -> bool:
+        return name in set(self.board_pins()) or name in ALL_KNOWN_PINS
+
+    def open_offset_dialog(self):
+        idx = self.selected_indices()
+        if not idx:
+            self._show_hint("Select the rules to copy first", 2500)
+            return
+        from .bulk_dialogs import OffsetDialog
+        self._dialog = OffsetDialog(self, [self._model[i] for i in idx], self._apply_offset)
+
+    def _apply_offset(self, copies: list[Rule], new_vars: list[str]):
+        idx = self.selected_indices()
+        new, sel = insert_rules(self._rules(), idx[-1] + 1, copies)
+        self._apply(new, select=sel)
+        added = self.page.ensure_variables(new_vars)
+        note = f"Added {len(copies)} rules"
+        if added:
+            note += f" and variable{'s' if len(added) > 1 else ''} {', '.join(added)}"
+        self._show_hint(note, 4000)
+
+    def open_range_dialog(self):
+        from .bulk_dialogs import RangeDialog
+        self._dialog = RangeDialog(self, self._apply_range)
+
+    def _apply_range(self, rules: list[Rule]):
+        idx = self.selected_indices()
+        at = idx[-1] + 1 if idx else len(self._model)
+        new, sel = insert_rules(self._rules(), at, rules)
+        self._apply(new, select=sel)
+        self._show_hint(f"Added {len(rules)} rules", 2500)
+
+    def open_find_dialog(self):
+        if self._dialog_open():
+            self._dialog.lift()
+            return
+        from .bulk_dialogs import FindDialog
+        self._dialog = FindDialog(self)
+
+    def replace_rules(self, idx: list[int], replaced: list[Rule]):
+        """Find and replace: `replaced[k]` is the new version of rule idx[k]."""
+        new = self._rules()
+        for i, r in zip(idx, replaced):
+            new[i] = r
+        if new != self._model.rules:
+            self._apply(new)
 
     # --------------------------------------------------------------- drag
 
     def drag_begin(self, card: RuleCard, y_root: int):
         self._flush_build()
-        self._drag = {"card": card, "gap": None, "y": y_root}
-        card.paint_border(t.ACCENT)
+        group = card in self._selection and len(self._selection) > 1
+        self._drag = {"card": card, "gap": None, "y": y_root, "y0": y_root, "group": group}
+        for c in (self._selection if group else [card]):
+            c.paint_border(t.ACCENT)
 
     def drag_update(self, y_root: int):
         if not self._drag:
@@ -1322,20 +1645,21 @@ class RuleEditor(ctk.CTkFrame):
             self._show_indicator(gap)
         self._autoscroll(y_root)
 
-    def drag_finish(self, y_root: int):
+    def drag_finish(self, y_root: int, state: int = 0):
         if not self._drag:
             return
         drag, self._drag = self._drag, None
         self._stop_autoscroll()
         self._indicator.place_forget()
         card = drag["card"]
-        card.paint_border()
-        gap = drag["gap"] if drag["gap"] is not None else self._gap_at(y_root)
-        src = self.index_of(card)
-        if gap in (src, src + 1):
+        for c in (self._selection if drag["group"] else [card]):
+            c.paint_border()
+        if abs(y_root - drag["y0"]) < 4:
+            # A click on the handle, not a drag: it selects.
+            self.click_select(card, state)
             return
-        dst = gap - 1 if gap > src else gap
-        self.move_card(card, dst)
+        gap = drag["gap"] if drag["gap"] is not None else self._gap_at(y_root)
+        self._move(self.selected_indices() if drag["group"] else [self.index_of(card)], gap)
 
     def _gap_at(self, y_root: int) -> int:
         """Insertion gap index for a pointer y: 0 = before the first card,

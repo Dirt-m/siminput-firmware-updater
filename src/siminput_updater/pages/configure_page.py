@@ -508,6 +508,18 @@ class ConfigurePage(ctk.CTkFrame):
                                   "store": store_cb, "extra": dict(bv.extra)})
         self._mark_dirty()
 
+    def variable_names(self) -> list[str]:
+        return [n for n in (w["name"].get().strip() for w in self._var_widgets) if n]
+
+    def ensure_variables(self, names: list[str]) -> list[str]:
+        """Add the named variables the Variables tab doesn't have yet (axis
+        names are left alone); returns the ones added."""
+        existing = set(self.variable_names()) | set(self.rule_editor.axis_choices())
+        added = [n for n in dict.fromkeys(names) if n not in existing]
+        for n in added:
+            self._add_var(BoolVar(id=n))
+        return added
+
     def _var_from_widgets(self, w: dict) -> BoolVar:
         return BoolVar(id=w["name"].get().strip(), default=bool(w["default"].get()),
                        store=bool(w["store"].get()), extra=dict(w.get("extra", {})))
