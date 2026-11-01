@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import threading
 from pathlib import Path
 from tkinter import filedialog
 from typing import TYPE_CHECKING
@@ -7,7 +8,10 @@ from typing import TYPE_CHECKING
 import customtkinter as ctk
 
 from .. import ui_theme as t
-from ..firmware import FirmwareError, UpdateCancelled, load_firmware_zip, perform_update
+from .. import releases
+from ..firmware import (
+    FirmwareError, FirmwarePackage, UpdateCancelled, _version_less, load_firmware_zip, perform_update,
+)
 from ..operations import OperationCancelled
 
 if TYPE_CHECKING:
@@ -19,25 +23,31 @@ class UpdatePage(ctk.CTkFrame):
         super().__init__(parent, fg_color="transparent")
         self.app = app
         self.package = None
+        self._latest: releases.Release | None = None
+        self._latest_checked = False
 
         self.grid_columnconfigure(0, weight=1)
 
         # -- 1. Select package --
         select = ctk.CTkFrame(self, fg_color=t.SURFACE, corner_radius=t.RADIUS)
         select.grid(row=0, column=0, sticky="ew", pady=(0, 14))
-        select.grid_columnconfigure(1, weight=1)
+        select.grid_columnconfigure(2, weight=1)
 
         ctk.CTkLabel(select, text="Firmware package", font=t.font(15, "bold"), text_color=t.TEXT).grid(
             row=0, column=0, columnspan=3, padx=18, pady=(16, 2), sticky="w")
         ctk.CTkLabel(
-            select, text="Choose a signed .zip built for this controller.",
+            select, text="Download the latest release, or choose a firmware .zip built for this controller.",
             font=t.font(12), text_color=t.TEXT_MUTED,
         ).grid(row=1, column=0, columnspan=3, padx=18, pady=(0, 14), sticky="w")
 
-        self.select_btn = t.ghost_button(select, "Choose .zip…", self._select_file, width=140)
-        self.select_btn.grid(row=2, column=0, padx=18, pady=(0, 16))
+        self.download_btn = t.ghost_button(select, "Download latest", self._download_latest, width=150)
+        self.download_btn.grid(row=2, column=0, padx=(18, 8), pady=(0, 6), sticky="w")
+        self.select_btn = t.ghost_button(select, "Choose .zip…", self._select_file, width=130)
+        self.select_btn.grid(row=2, column=1, padx=0, pady=(0, 6), sticky="w")
         self.file_label = ctk.CTkLabel(select, text="No file selected", font=t.font(13), text_color=t.TEXT_MUTED, anchor="w")
-        self.file_label.grid(row=2, column=1, padx=(0, 18), pady=(0, 16), sticky="w")
+        self.file_label.grid(row=2, column=2, padx=(12, 18), pady=(0, 6), sticky="w")
+        self.latest_label = ctk.CTkLabel(select, text="", font=t.font(12), text_color=t.TEXT_MUTED, anchor="w")
+        self.latest_label.grid(row=3, column=0, columnspan=3, padx=18, pady=(0, 14), sticky="w")
 
         # -- 2. Package details --
         self.info_frame = ctk.CTkFrame(self, fg_color=t.SURFACE, corner_radius=t.RADIUS)
@@ -90,6 +100,65 @@ class UpdatePage(ctk.CTkFrame):
 
     def on_show(self):
         self._refresh_action()
+        if not self._latest_checked:
+            self._latest_checked = True
+            self._check_latest()
+
+    # ----------------------------------------------------- GitHub release
+
+    def _check_latest(self):
+        """Look up the latest release in the background (once per session)
+        and say how it compares with the box."""
+        self.latest_label.configure(text="Checking GitHub for the latest firmware…", text_color=t.TEXT_MUTED)
+
+        def work():
+            try:
+                rel, err = releases.fetch_latest(), None
+            except releases.ReleaseError as e:
+                rel, err = None, str(e)
+            self.app.post(lambda: self._show_latest(rel, err))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _show_latest(self, rel: releases.Release | None, err: str | None):
+        self._latest = rel
+        if rel is None:
+            self.latest_label.configure(text=f"{err}. You can still choose a .zip.", text_color=t.TEXT_MUTED)
+            return
+        text, color = f"Latest release: v{rel.version}", t.TEXT_MUTED
+        info = self.app.device.info if self.app.device.connected else None
+        if info is not None:
+            if _version_less(info.version, rel.version):
+                text, color = f"v{rel.version} is available. Your box runs v{info.version}.", t.ACCENT
+            else:
+                text = f"Your box runs v{info.version}, the latest release is v{rel.version}."
+        self.latest_label.configure(text=text, text_color=color)
+
+    def _download_latest(self):
+        known = self._latest
+
+        def work(ctx):
+            ctx.status("Looking up the latest release…")
+            rel = known or releases.fetch_latest()
+            ctx.status(f"Downloading {rel.asset_name}…")
+            path = releases.download(
+                rel, progress=lambda got, total: ctx.progress(got / total if total else 0),
+                should_cancel=lambda: ctx.cancelled)
+            if ctx.cancelled:
+                raise OperationCancelled()
+            ctx.status("Checking the package…")
+            pkg = load_firmware_zip(str(path))
+            if str(pkg.firmware_version).lstrip("vV") != rel.version:
+                raise FirmwareError(f"The package says v{pkg.firmware_version} but the release is {rel.tag}")
+            return rel, path, pkg
+
+        def on_success(result):
+            rel, path, pkg = result
+            self._latest = rel
+            self._set_package(pkg, f"{path.name} (from GitHub)")
+
+        self.app.run_operation("Downloading firmware", work, on_success=on_success,
+                               success_message="Firmware downloaded and checked", indeterminate=False)
 
     def _refresh_action(self):
         # Keep the "on device" chip current: it used to be written only when a
@@ -99,6 +168,8 @@ class UpdatePage(ctk.CTkFrame):
             self._cur_ver.configure(text=f"v{self.app.device.info.version}")
         else:
             self._cur_ver.configure(text="—")
+        if self._latest is not None:
+            self._show_latest(self._latest, None)   # the box may have changed
 
         if not self.package:
             self.upload_btn.configure(state="disabled", fg_color=t.SURFACE_3, text_color=t.TEXT_MUTED)
@@ -118,15 +189,18 @@ class UpdatePage(ctk.CTkFrame):
         if not path:
             return
         try:
-            self.package = load_firmware_zip(path)
+            pkg = load_firmware_zip(path)
         except FirmwareError as e:
             self.file_label.configure(text=f"Error: {e}", text_color=t.ERROR)
             self.info_frame.grid_remove()
             self.package = None
             self._refresh_action()
             return
+        self._set_package(pkg, Path(path).name)
 
-        self.file_label.configure(text=Path(path).name, text_color=t.TEXT)
+    def _set_package(self, pkg: FirmwarePackage, label: str):
+        self.package = pkg
+        self.file_label.configure(text=label, text_color=t.TEXT)
 
         self._pkg_ver.configure(text=f"v{self.package.firmware_version}")
         self._file_count.configure(text=str(len(self.package.files)))
