@@ -422,3 +422,47 @@ def diff_span(old: list[Rule], new: list[Rule]) -> tuple[int, int]:
     while suf < n - pre and old[-1 - suf] == new[-1 - suf]:
         suf += 1
     return pre, suf
+
+
+# ------------------------------------------------------------ suggestions
+
+_VAR_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+def _uses(indices: list[int] | None) -> str:
+    if not indices:
+        return "free"
+    nums = [str(i + 1) for i in indices[:3]] + (["…"] if len(indices) > 3 else [])
+    return ("rule " if len(indices) == 1 else "rules ") + ", ".join(nums)
+
+
+def ref_candidates(kind: str, pins: list[str], pin_usage: dict[str, list[int]],
+                   button_usage: dict[int, list[int]], variables: list[str]) -> list[tuple[str, str]]:
+    """(name, note) pairs a rule field can take. `kind` "in" reads a pin,
+    variable or button; "out" drives a button, variable or REFRESH."""
+    buttons = [(f"B{n}", _uses(button_usage.get(n))) for n in range(1, 128)]
+    vars_ = [(v, "variable") for v in variables]
+    if kind == "in":
+        return [(p, _uses(pin_usage.get(p))) for p in sorted(pins, key=pin_order)] + vars_ + buttons
+    return buttons + vars_ + [("REFRESH", "re-sends all inputs")]
+
+
+def rank_suggestions(text: str, candidates: list[tuple[str, str]],
+                     limit: int = 8) -> list[tuple[str, str]]:
+    """Names starting with `text` first, then names containing it, each in
+    their given order. With no text, free ones come first."""
+    t = text.strip().lower()
+    if not t:
+        free = [c for c in candidates if c[1] == "free"]
+        return (free + [c for c in candidates if c[1] != "free"])[:limit]
+    starts = [c for c in candidates if c[0].lower().startswith(t)]
+    inside = [c for c in candidates if t in c[0].lower() and not c[0].lower().startswith(t)]
+    return (starts + inside)[:limit]
+
+
+def can_create_variable(text: str, taken: set[str]) -> bool:
+    """True when `text` would make a valid new variable name: no spaces, not
+    a pin, button, existing variable, axis, or REFRESH."""
+    text = text.strip()
+    return (bool(_VAR_NAME.match(text)) and text not in taken
+            and not _B_PATTERN.match(text) and text != "REFRESH")

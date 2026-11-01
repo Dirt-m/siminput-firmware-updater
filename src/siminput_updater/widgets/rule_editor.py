@@ -33,9 +33,10 @@ from ..config_model import (
     pins_for_board,
 )
 from ..rule_list import (
-    History, RuleList, diff_span, insert_rules, move_to_gap, nudge, remove_indices,
-    rule_inputs, rules_from_text, rules_to_text,
+    History, RuleList, can_create_variable, diff_span, insert_rules, move_to_gap, nudge,
+    rank_suggestions, ref_candidates, remove_indices, rule_inputs, rules_from_text, rules_to_text,
 )
+from . import suggest
 from .calibrate_dialog import CalibrateDialog
 
 if TYPE_CHECKING:
@@ -56,6 +57,9 @@ AUTOSCROLL_MARGIN = 28  # px from the viewport edge that starts auto-scroll
 UNDO_WINDOW_MS = 10000  # how long "Undo" stays offered after a delete
 EDIT_COMMIT_MS = 700    # a pause in typing this long ends one undo step
 SHIFT, CONTROL = 0x1, 0x4   # event.state bits
+CREATE_PREFIX = "\0create:"   # a suggestion value that makes a new variable
+IN_FIELDS = ("input", "pin_a", "pin_b", "inputs")
+OUT_FIELDS = ("output", "cw", "ccw")
 
 
 def _opt_int(text: str):
@@ -147,11 +151,11 @@ def _entry(master, bg: str, width=78):
 
 
 class Picker(tk.Label):
-    """A dropdown drawn as a plain label; the choices open in a tk.Menu.
+    """A dropdown drawn as a plain label; the choices open in the shared
+    `SuggestPopup`, where typing filters them.
 
-    Replaces CTkOptionMenu on the card (its single largest cost). The menu is
-    built fresh per click with resolved colours, so only the label needs
-    re-theming.
+    Replaces CTkOptionMenu on the card (its single largest cost). The popup
+    resolves its colours per show, so only the label needs re-theming.
     """
 
     def __init__(self, master, values: list[str], command: Callable[[str], None], width_chars: int = 16):
@@ -183,15 +187,12 @@ class Picker(tk.Label):
         )
 
     def _open(self, _e=None):
-        menu = tk.Menu(
-            self, tearoff=0, relief="flat", borderwidth=0,
-            bg=t.resolve(t.SURFACE_2), fg=t.resolve(t.TEXT),
-            activebackground=t.resolve(t.HOVER), activeforeground=t.resolve(t.TEXT),
-            font=t.tk_font(self, 12),
-        )
-        for v in self._values:
-            menu.add_command(label=v, command=lambda v=v: self._choose(v))
-        _popup(menu, self.winfo_rootx(), self.winfo_rooty() + self.winfo_height())
+        pop = suggest.SuggestPopup.for_widget(self)
+        if pop.is_open and pop.anchor is self:
+            pop.hide()   # a second click on the picker closes it
+            return "break"
+        pop.show_list(self, [(v, v) for v in self._values], self._value, self._choose)
+        return "break"
 
     def _choose(self, value: str):
         if value != self._value:
@@ -460,7 +461,27 @@ class RuleCard(tk.Frame):
             e.insert(0, current)
         self._bind_entry(e)
         self._widgets[key] = e
+        if key in IN_FIELDS or key in OUT_FIELDS:
+            self._suggest(e, key)
         return e
+
+    def _suggest(self, e, key: str, token: bool = False):
+        kind = "in" if key in IN_FIELDS else "out"
+
+        def accept(value: str):
+            if value.startswith(CREATE_PREFIX):
+                value = value[len(CREATE_PREFIX):]
+                self.editor.page.ensure_variables([value])
+                self.editor._show_hint(f"Added variable {value}", 2500)
+            if token:
+                done = [x.strip() for x in e.get().split(",")[:-1] if x.strip()]
+                value = ", ".join(done + [value])
+            e.delete(0, "end")
+            e.insert(0, value)
+            e.icursor("end")
+            self._sync()
+
+        suggest.attach(e, lambda text: self.editor.suggestions(kind, text), accept, token=token)
 
     def _num(self, parent, key, current):
         e = _entry(parent, self._bg, width=64)
@@ -476,6 +497,7 @@ class RuleCard(tk.Frame):
             e.insert(0, ", ".join(current))
         self._bind_entry(e)
         self._widgets[key] = e
+        self._suggest(e, key, token=True)
         return e
 
     def _opt(self, parent, key, current, placeholder: str):
@@ -1581,6 +1603,22 @@ class RuleEditor(ctk.CTkFrame):
 
     def is_pin(self, name: str) -> bool:
         return name in set(self.board_pins()) or name in ALL_KNOWN_PINS
+
+    def suggestions(self, kind: str, text: str) -> list[tuple[str, str]]:
+        """Autocomplete for a pin ("in") or output ("out") field: matching
+        names with what uses them, plus "Create variable" for a new name."""
+        variables = self.page.variable_names()
+        pins = self.board_pins()
+        model = self._model
+        ranked = rank_suggestions(text, ref_candidates(kind, pins, model.pin_usage(),
+                                                       model.button_usage(), variables))
+        items = [(name, f"{name:<9} {note}") for name, note in ranked]
+        taken = set(pins) | set(ALL_KNOWN_PINS) | set(variables) | set(self.axis_choices())
+        if text and can_create_variable(text, taken):
+            create = (CREATE_PREFIX + text.strip(), f"+ Create variable {text.strip()}")
+            # A new name typed in full: offer it first; otherwise after the matches.
+            items = [create] + items if not items else items + [create]
+        return items
 
     def open_offset_dialog(self):
         idx = self.selected_indices()
