@@ -7,7 +7,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 from siminput_updater.config_model import ALL_KNOWN_PINS, Rule  # noqa: E402
 from siminput_updater.rule_list import (  # noqa: E402
     History, count_matches, default_offsets, diff_span, move_to_gap, nudge, pin_range,
-    range_rules, remove_indices, replace_refs, rules_from_text, rules_to_text, shift_name,
+    range_rules, remove_indices, replace_refs, rule_matches, rules_from_text, rules_to_text, shift_name,
     shifted_copies, variables_in,
 )
 
@@ -117,6 +117,20 @@ class FindReplace(unittest.TestCase):
     def test_substring_mode(self):
         self.assertEqual(count_matches(self.RULES, "D1", whole=False), (3, 3))
         self.assertEqual(replace_refs(self.RULES[1], "D1", "D2", whole=False).input, "D20")
+
+
+class Filter(unittest.TestCase):
+    def test_full_name_is_exact(self):
+        self.assertTrue(rule_matches(Rule(type="MAP", input="D1", output="B1"), "d1"))
+        self.assertFalse(rule_matches(Rule(type="MAP", input="D10", output="B10"), "D1"))
+        self.assertTrue(rule_matches(Rule(type="NOR", inputs=["D3", "D1"], output="B9"), "D1"))
+
+    def test_partial_text_and_type_label(self):
+        enc = Rule(type="ENCODER", inputs=["D19", "D20"], cw="B19", ccw="B20", axis="AX1")
+        self.assertTrue(rule_matches(enc, "enco", "Rotary Encoder"))
+        self.assertTrue(rule_matches(Rule(type="TOGGLE", input="D5", output="TOGGLE1"), "togg"))
+        self.assertFalse(rule_matches(enc, "toggle", "Rotary Encoder"))
+        self.assertTrue(rule_matches(enc, ""))
 
 
 class Clipboard(unittest.TestCase):

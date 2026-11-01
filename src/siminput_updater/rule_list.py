@@ -466,3 +466,23 @@ def can_create_variable(text: str, taken: set[str]) -> bool:
     text = text.strip()
     return (bool(_VAR_NAME.match(text)) and text not in taken
             and not _B_PATTERN.match(text) and text != "REFRESH")
+
+
+# ---------------------------------------------------------------- filter
+
+_FULL_NAME = re.compile(r"^[A-Za-z_]+\d+$")
+
+
+def rule_matches(rule: Rule, text: str, type_label: str = "") -> bool:
+    """Filter test for the Rules tab. A full name (D1, B12, TOGGLE1) matches
+    only that name, so D1 never shows the D10-D19 rules; anything else
+    matches as a substring of the names, the axis or the rule type."""
+    text = text.strip().lower()
+    if not text:
+        return True
+    if rule.comment:
+        return text in rule.summary().lower()
+    names = [x.lower() for x in (rule.input, *rule.inputs, rule.output, rule.cw, rule.ccw, rule.axis) if x]
+    if _FULL_NAME.match(text):
+        return text in names
+    return any(text in n for n in names) or text in type_label.lower() or text in rule.type.lower()
