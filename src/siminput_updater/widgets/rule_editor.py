@@ -26,7 +26,7 @@ from ..config_model import (
     ANALOG_HYSTERESIS_DEFAULT, ANALOG_MAX, ANALOG_RULE_TYPES, RULE_TYPE_LABELS,
     THRESHOLD_HYSTERESIS_DEFAULT, Rule, _pin_sort_key, analog_pins_for_board,
 )
-from ..rule_list import RuleList
+from ..rule_list import RuleList, rule_inputs
 from .calibrate_dialog import CalibrateDialog
 
 if TYPE_CHECKING:
@@ -217,6 +217,7 @@ class RuleCard(tk.Frame):
         self._errors: dict[str, str] = {}
         self._tips: dict[int, str] = {}   # id(widget) → message shown on hover
         self._learn_glyphs: dict[str, Glyph] = {}
+        self._live = False    # reads a pin that is pressed on the box right now
         self._plain: list[tk.Widget] = []     # plain-tk children to retheme
         self._ctk_children: list = []          # CTk children needing bg_color sync
         self._rows: list[tk.Frame] = []
@@ -228,7 +229,11 @@ class RuleCard(tk.Frame):
         self._dim = t.resolve(t.TEXT_DIM)
         self._muted = t.resolve(t.TEXT_MUTED)
         self._cap_font = t.tk_font(parent, 12)
-        self.configure(bg=bg, highlightbackground=t.resolve(t.BORDER), highlightcolor=t.resolve(t.BORDER))
+        self.configure(bg=bg)
+        self.paint_border()
+        # Hovering a card shows its pins and buttons in the side panel.
+        self.bind("<Enter>", lambda _e: editor.card_hover(self, True), add="+")
+        self.bind("<Leave>", lambda _e: editor.card_hover(self, False), add="+")
 
         # -- left rail: drag handle + number --
         rail = tk.Frame(self, bg=bg)
@@ -543,8 +548,8 @@ class RuleCard(tk.Frame):
         bg = self._bg = t.resolve(t.SURFACE_2)
         self._dim = t.resolve(t.TEXT_DIM)
         self._muted = t.resolve(t.TEXT_MUTED)
-        border = t.resolve(t.BORDER)
-        self.configure(bg=bg, highlightbackground=border, highlightcolor=border)
+        self.configure(bg=bg)
+        self.paint_border()
         for w in self._plain:
             if not w.winfo_exists():
                 continue
@@ -557,7 +562,8 @@ class RuleCard(tk.Frame):
         for row in self._rows:
             row.configure(bg=bg)
         self.handle.configure(bg=bg, fg=self._muted)
-        self.num.configure(bg=bg, fg=self._muted)
+        self.num.configure(bg=bg)
+        self.set_live(self._live)
         if self.summary is not None and self.summary.winfo_exists():
             self.summary.configure(bg=bg, fg=self._muted)
         for g in self._glyphs:
@@ -565,6 +571,16 @@ class RuleCard(tk.Frame):
         for c in self._ctk_children:
             if c.winfo_exists():
                 c.configure(bg_color=bg)
+
+    def paint_border(self, color=None):
+        """Outline in `color`, else green while a pin it reads is pressed."""
+        c = t.resolve(color or (t.SUCCESS if self._live else t.BORDER))
+        self.configure(highlightbackground=c, highlightcolor=c)
+
+    def set_live(self, on: bool):
+        self._live = on
+        self.paint_border()
+        self.num.configure(fg=t.resolve(t.SUCCESS) if on else self._muted)
 
     def set_number(self, n: int):
         self.num.configure(text=str(n))
@@ -868,6 +884,10 @@ class RuleEditor(ctk.CTkFrame):
 
         self._model = RuleList()
         self._cards: list[RuleCard] = []
+        # Side panel hooks: told which rule the mouse is over (None when none).
+        self.hover_listener: Callable[[Rule | None], None] | None = None
+        self._hover_card: RuleCard | None = None
+        self._live_pins: set[str] = set()
         self._errors: dict[int, dict[str, str]] = {}
         self._build_pending: list[Rule] = []
         self._build_after: str | None = None
@@ -892,6 +912,12 @@ class RuleEditor(ctk.CTkFrame):
 
     def __len__(self) -> int:
         return len(self._model)
+
+    @property
+    def model(self) -> RuleList:
+        """The rules as last synced from the cards (each card syncs on every
+        keystroke), without forcing a re-read of every field."""
+        return self._model
 
     def axis_choices(self) -> list[str]:
         """Current axis names from the Axes tab, for the AXIS_* target dropdown."""
@@ -941,6 +967,7 @@ class RuleEditor(ctk.CTkFrame):
         never freezes the window."""
         self._cancel_build()
         self.cancel_learn()
+        self._set_hover(None)
         for card in self._cards:
             card.destroy()
         self._cards.clear()
@@ -992,6 +1019,38 @@ class RuleEditor(ctk.CTkFrame):
             card.focus_field(field)
         else:
             card.focus_first()
+
+    # ------------------------------------------------------ side panel hooks
+
+    def card_hover(self, card: RuleCard, entered: bool):
+        if not entered:
+            # Leave also fires when the pointer moves onto one of the card's
+            # own fields; only a pointer outside the card ends the hover.
+            x, y = self.winfo_pointerxy()
+            inside = (card.winfo_rootx() <= x < card.winfo_rootx() + card.winfo_width()
+                      and card.winfo_rooty() <= y < card.winfo_rooty() + card.winfo_height())
+            if inside:
+                return
+            if self._hover_card is not card:
+                return
+        self._set_hover(card if entered else None)
+
+    def _set_hover(self, card: RuleCard | None):
+        if card is self._hover_card:
+            return
+        self._hover_card = card
+        if self.hover_listener is not None:
+            self.hover_listener(card.rule if card is not None else None)
+
+    def set_live_pins(self, pressed: set[str]):
+        """Outline the cards that read a pin pressed on the box right now."""
+        if pressed == self._live_pins:
+            return
+        self._live_pins = set(pressed)
+        for card in self._cards:
+            on = bool(pressed) and bool(rule_inputs(card.rule) & pressed)
+            if on != card._live:
+                card.set_live(on)
 
     # ----------------------------------------------------- incremental build
 
@@ -1163,9 +1222,9 @@ class RuleEditor(ctk.CTkFrame):
 
     # --------------------------------------------------------- operations
 
-    def add_rule(self):
+    def add_rule(self, input_pin: str | None = None):
         self._flush_build()
-        rule = self._model.new_rule(self.device_pins())
+        rule = self._model.new_rule(self.device_pins(), input_pin=input_pin)
         index = self._model.append(rule)
         card = RuleCard(self.scroll, self, rule)
         self._place_card(card, index)
@@ -1192,6 +1251,8 @@ class RuleEditor(ctk.CTkFrame):
         card._apply_edits()
         rule = self._model.remove(index)
         self._cards.pop(index)
+        if self._hover_card is card:
+            self._set_hover(None)
         card.destroy()
         self._regrid(index)
         self._renumber(index)
@@ -1249,7 +1310,7 @@ class RuleEditor(ctk.CTkFrame):
     def drag_begin(self, card: RuleCard, y_root: int):
         self._flush_build()
         self._drag = {"card": card, "gap": None, "y": y_root}
-        card.configure(highlightbackground=t.resolve(t.ACCENT), highlightcolor=t.resolve(t.ACCENT))
+        card.paint_border(t.ACCENT)
 
     def drag_update(self, y_root: int):
         if not self._drag:
@@ -1268,7 +1329,7 @@ class RuleEditor(ctk.CTkFrame):
         self._stop_autoscroll()
         self._indicator.place_forget()
         card = drag["card"]
-        card.configure(highlightbackground=t.resolve(t.BORDER), highlightcolor=t.resolve(t.BORDER))
+        card.paint_border()
         gap = drag["gap"] if drag["gap"] is not None else self._gap_at(y_root)
         src = self.index_of(card)
         if gap in (src, src + 1):

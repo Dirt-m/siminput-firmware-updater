@@ -18,6 +18,7 @@ from ..config_model import (
     validate,
 )
 from ..firmware import _write_backup
+from ..widgets.io_panel import RulesSidebar
 from ..widgets.live_panel import LivePanel
 from ..widgets.rule_editor import RuleEditor
 
@@ -673,6 +674,8 @@ class ConfigurePage(ctk.CTkFrame):
 
         self.rule_editor = RuleEditor(tab, self)
         self.rule_editor.grid(row=1, column=0, sticky="nsew", padx=4, pady=4)
+        # Every pin and button beside the cards: used, free, pressed now.
+        self.rules_sidebar = RulesSidebar(tab, self)
 
     # ----------------------------------------------------- config sync
 
@@ -773,6 +776,7 @@ class ConfigurePage(ctk.CTkFrame):
             self._axes_empty.grid()
 
         self.rule_editor.load_rules(config.rules)
+        self.rules_sidebar.refresh()
         self._has_config = True
         self._clear_dirty()
         self._validate_now()
@@ -782,6 +786,9 @@ class ConfigurePage(ctk.CTkFrame):
             self._dirty = True
             self.dirty_label.configure(text="Unsaved changes")
         self._schedule_validate()
+        sidebar = getattr(self, "rules_sidebar", None)
+        if sidebar is not None:
+            sidebar.schedule_refresh()
 
     def _clear_dirty(self):
         self._dirty = False
@@ -802,6 +809,11 @@ class ConfigurePage(ctk.CTkFrame):
         self.live_panel.set_connected(connected)
         # The connected firmware decides whether analog rule types are offered.
         self.rule_editor.refresh_type_menus()
+        # The connected board decides which pins the side panel shows.
+        self.rules_sidebar.refresh_pins()
+        if not connected:
+            self.rules_sidebar.clear_live()
+            self.rule_editor.set_live_pins(set())
         self._schedule_validate()
         if connected:
             # Posted, not called: this can run inside another operation's
@@ -833,6 +845,8 @@ class ConfigurePage(ctk.CTkFrame):
             state = {**state, "an": {}}
         self.live_panel.update(state)
         self.rule_editor.on_live_state(state)
+        self.rules_sidebar.set_live(state)
+        self.rule_editor.set_live_pins({p for p, on in (state.get("p") or {}).items() if on})
 
     def on_show(self):
         self._refresh_connection_state()
@@ -842,6 +856,8 @@ class ConfigurePage(ctk.CTkFrame):
 
     def on_hide(self):
         self.rule_editor.cancel_learn()
+        self.rules_sidebar.clear_live()
+        self.rule_editor.set_live_pins(set())
         self.app.monitor.unsubscribe(self._on_live)
         self.app.monitor.release()
 

@@ -5,7 +5,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 from siminput_updater.config_model import Rule  # noqa: E402
-from siminput_updater.rule_list import RuleList, next_free  # noqa: E402
+from siminput_updater.rule_list import RuleList, next_free, rule_buttons, rule_inputs  # noqa: E402
 
 
 def _maps(n):
@@ -123,6 +123,43 @@ class NewRuleDefaults(unittest.TestCase):
     def test_falls_back_to_known_pins(self):
         r = RuleList().new_rule(None)
         self.assertEqual(r.input, "D1")  # digital pins first, then analog
+
+    def test_input_pin_fixes_the_input(self):
+        rl = RuleList([Rule(type="MAP", input="D1", output="B1")])
+        r = rl.new_rule(self.PINS, input_pin="A1")
+        self.assertEqual((r.input, r.output), ("A1", "B2"))
+
+
+class Usage(unittest.TestCase):
+    """What the Rules side panel paints as used: pins read, buttons driven."""
+
+    RULES = [
+        Rule(type="MAP", input="D1", output="B1"),
+        Rule(type="ENCODER", inputs=["D2", "D3"], cw="B5", ccw="B6"),
+        Rule(type="TOGGLE", input="D1", output="T1"),
+        Rule(type="MAP", input="T1", output="B0"),
+        Rule(type="NOR", inputs=["D2", ""], output="B128"),
+        Rule(comment=True, raw={"note": "x"}),
+    ]
+
+    def test_rule_inputs_and_buttons(self):
+        enc = self.RULES[1]
+        self.assertEqual(rule_inputs(enc), {"D2", "D3"})
+        self.assertEqual(rule_buttons(enc), {5, 6})
+        self.assertEqual(rule_inputs(self.RULES[4]), {"D2"})  # blank entries dropped
+
+    def test_buttons_outside_1_to_127_ignored(self):
+        self.assertEqual(rule_buttons(self.RULES[3]), set())   # B0 is never driven
+        self.assertEqual(rule_buttons(self.RULES[4]), set())   # B128 does not exist
+
+    def test_comments_use_nothing(self):
+        self.assertEqual(rule_inputs(self.RULES[5]), set())
+        self.assertEqual(rule_buttons(self.RULES[5]), set())
+
+    def test_usage_maps_to_rule_indices(self):
+        rl = RuleList(self.RULES)
+        self.assertEqual(rl.pin_usage(), {"D1": [0, 2], "D2": [1, 4], "D3": [1], "T1": [3]})
+        self.assertEqual(rl.button_usage(), {1: [0], 5: [1], 6: [1]})
 
 
 if __name__ == "__main__":
