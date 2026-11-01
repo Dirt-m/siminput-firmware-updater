@@ -486,3 +486,39 @@ def rule_matches(rule: Rule, text: str, type_label: str = "") -> bool:
     if _FULL_NAME.match(text):
         return text in names
     return any(text in n for n in names) or text in type_label.lower() or text in rule.type.lower()
+
+
+# -------------------------------------------------------------- templates
+
+ENCODER_AXIS_STEP = 2048   # 32 detents sweep the full 0-65535 axis
+
+
+def encoder_template(pin_a: str, pin_b: str, axis: str = "", cw: str = "", ccw: str = "",
+                     step: int = ENCODER_AXIS_STEP) -> list[Rule]:
+    """A rotary encoder that steps an axis, presses buttons, or both."""
+    return [Rule(type="ENCODER", inputs=[pin_a, pin_b], axis=axis, cw=cw, ccw=ccw,
+                 step=step if axis else 1)]
+
+
+def three_way_template(up: str, down: str, first_button: int) -> list[Rule]:
+    """An ON-OFF-ON switch on two pins as three buttons: up, down, and the
+    middle position (neither pin closed)."""
+    return [
+        Rule(type="MAP", input=up, output=f"B{first_button}"),
+        Rule(type="MAP", input=down, output=f"B{first_button + 1}"),
+        Rule(type="NOR", inputs=[up, down], output=f"B{first_button + 2}"),
+    ]
+
+
+def toggle_template(pin: str, variable: str, button: str) -> list[Rule]:
+    """A push button that latches: each press flips `variable`, which holds
+    `button` down while it is on."""
+    return [Rule(type="TOGGLE", input=pin, output=variable),
+            Rule(type="MAP", input=variable, output=button)]
+
+
+def next_variable(prefix: str, taken: set[str]) -> str:
+    n = 1
+    while f"{prefix}{n}" in taken:
+        n += 1
+    return f"{prefix}{n}"

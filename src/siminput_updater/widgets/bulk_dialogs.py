@@ -13,10 +13,11 @@ from typing import TYPE_CHECKING, Callable
 import customtkinter as ctk
 
 from .. import ui_theme as t
-from ..config_model import RULE_TYPE_LABELS, Rule
+from ..config_model import ALL_KNOWN_PINS, RULE_TYPE_LABELS, Rule
 from ..rule_list import (
-    BUTTON_REFS, count_matches, default_offsets, next_free, pin_order, pin_range,
-    range_rules, replace_refs, shifted_copies, variables_in,
+    BUTTON_REFS, ENCODER_AXIS_STEP, can_create_variable, count_matches, default_offsets, encoder_template, next_free,
+    next_variable, pin_order, pin_range, range_rules, replace_refs, shifted_copies,
+    three_way_template, toggle_template, variables_in,
 )
 
 if TYPE_CHECKING:
@@ -325,3 +326,162 @@ class FindDialog(_Dialog):
         self.editor.replace_rules(idx, [replace_refs(model[i], find, repl, self.whole.get()) for i in idx])
         self.say(f"Replaced {_n(fields, 'field')}. Ctrl+Z on the rules undoes it.")
         self.ok.configure(state="disabled")
+
+
+class TemplateDialog(_Dialog):
+    """A few fields that build a common pattern of rules. Defaults are the
+    next free pins and buttons, so Enter alone usually does it."""
+
+    def __init__(self, editor: RuleEditor, title: str, intro: str,
+                 fields: list[tuple[str, str, str, str]],
+                 build: Callable[[dict], tuple[list[Rule], list[str], list[str]] | str],
+                 on_apply: Callable[[list[Rule], list[str], list[str]], None]):
+        super().__init__(editor, title, "Add rules")
+        self._build, self.on_apply = build, on_apply
+        ctk.CTkLabel(self.body, text=intro, font=t.font(12), text_color=t.TEXT_DIM, anchor="w",
+                     justify="left", wraplength=380).grid(row=self._row, column=0, columnspan=3,
+                                                          sticky="w", pady=(0, 8))
+        self._row += 1
+        self.entries: dict[str, ctk.CTkEntry] = {}
+        for key, label, default, hint in fields:
+            self.entries[key] = self.field(label, self.entry(default, 90), hint)
+        self.refresh()
+        first = next(iter(self.entries.values()), None)
+        if first is not None:
+            first.focus_set()
+
+    def values(self) -> dict:
+        return {k: e.get().strip() for k, e in self.entries.items()}
+
+    def refresh(self):
+        built = self._build(self.values())
+        if isinstance(built, str):
+            self.say(built, error=True)
+            return
+        rules, new_vars, new_axes = built
+        lines = [f"Adds {_n(len(rules), 'rule')}: " + "; ".join(r.summary() for r in rules)]
+        if new_vars:
+            lines.append(f"Creates variable {', '.join(new_vars)}")
+        if new_axes:
+            lines.append(f"Creates axis {', '.join(new_axes)} on the Axes tab")
+        self.say("\n".join(lines))
+
+    def run(self):
+        built = self._build(self.values())
+        if isinstance(built, str):
+            return
+        self.close()
+        self.on_apply(*built)
+
+
+def _free(editor: RuleEditor, n: int) -> list[str]:
+    """The next `n` pins no rule reads."""
+    used = set(editor.model.used_inputs())
+    out = []
+    for p in sorted(editor.board_pins(), key=pin_order):
+        if p not in used and len(out) < n:
+            out.append(p)
+    return out + [""] * (n - len(out))
+
+
+def _free_buttons(editor: RuleEditor, n: int) -> list[str]:
+    used = set(editor.model.used_outputs())
+    return ([b for b in BUTTON_REFS if b not in used][:n] + [""] * n)[:n]
+
+
+def _check_pins(editor: RuleEditor, *pins: str) -> str | None:
+    board = set(editor.board_pins())
+    for p in pins:
+        if not p:
+            return "Fill in every pin"
+        if p not in board:
+            return f"{p} is not a pin on this board"
+    if len(set(pins)) < len(pins):
+        return "Use different pins"
+    return None
+
+
+def _button(text: str) -> int | None:
+    n = _int(text.lstrip("Bb"))
+    return n if n is not None and 1 <= n <= 127 else None
+
+
+def encoder_dialog(editor: RuleEditor, on_apply):
+    a, b = _free(editor, 2)
+    axes = editor.axis_choices()
+    cw, ccw = _free_buttons(editor, 2)
+
+    def build(v):
+        err = _check_pins(editor, v["a"], v["b"])
+        if err:
+            return err
+        axis, step = v["axis"], _int(v["step"]) if v["step"] else ENCODER_AXIS_STEP
+        cw_, ccw_ = v["cw"], v["ccw"]
+        if not axis and not (cw_ or ccw_):
+            return "Give it an axis, buttons, or both"
+        for ref in (cw_, ccw_):
+            if ref and _button(ref) is None:
+                return f"{ref} is not a button (B1-B127)"
+        if axis and (step is None or step < 1):
+            return "Axis step is a whole number from 1"
+        new_axes = [axis] if axis and axis not in axes else []
+        return encoder_template(v["a"], v["b"], axis, cw_, ccw_, step or ENCODER_AXIS_STEP), [], new_axes
+
+    return TemplateDialog(
+        editor, "Encoder with axis",
+        "A rotary encoder that turns an axis up and down, and can press a button per click too. "
+        "Leave the axis or the buttons blank to skip them.",
+        [("a", "Pin A", a, ""), ("b", "Pin B", b, ""),
+         ("axis", "Axis", axes[0] if axes else "AX1", "" if axes else "new, made on the Axes tab"),
+         ("step", "Axis step", str(ENCODER_AXIS_STEP), "per click; 2048 sweeps it in 32"),
+         ("cw", "CW button", cw, "optional"), ("ccw", "CCW button", ccw, "optional")],
+        build, on_apply)
+
+
+def three_way_dialog(editor: RuleEditor, on_apply):
+    up, down = _free(editor, 2)
+    first = _free_buttons(editor, 1)[0] or "B1"
+
+    def build(v):
+        err = _check_pins(editor, v["up"], v["down"])
+        if err:
+            return err
+        n = _button(v["first"])
+        if n is None or n + 2 > 127:
+            return "The first button is B1 to B125 (it uses three)"
+        return three_way_template(v["up"], v["down"], n), [], []
+
+    return TemplateDialog(
+        editor, "3-position switch",
+        "An ON-OFF-ON switch wired to two pins becomes three buttons: up, down, "
+        "and the middle position when neither pin is closed.",
+        [("up", "Up pin", up, ""), ("down", "Down pin", down, ""),
+         ("first", "First button", first, "up; then down, then middle")],
+        build, on_apply)
+
+
+def toggle_dialog(editor: RuleEditor, on_apply):
+    (pin,) = _free(editor, 1)
+    (button,) = _free_buttons(editor, 1)
+    variables = set(editor.page.variable_names())
+    var = next_variable("TOGGLE", variables | set(editor.axis_choices()))
+
+    def build(v):
+        err = _check_pins(editor, v["pin"])
+        if err:
+            return err
+        if _button(v["button"]) is None:
+            return f"{v['button'] or 'The button'} is not a button (B1-B127)"
+        name = v["var"]
+        taken = set(editor.board_pins()) | set(ALL_KNOWN_PINS) | set(editor.axis_choices())
+        if name not in variables and not can_create_variable(name, taken):
+            return "Pick a variable name without spaces that isn't a pin, button or axis"
+        return toggle_template(v["pin"], name, f"B{_button(v['button'])}"), \
+            ([name] if name not in variables else []), []
+
+    return TemplateDialog(
+        editor, "Toggle with button",
+        "A push button that latches: press once and the button stays on, press again and it "
+        "turns off. A variable holds the state.",
+        [("pin", "Pin", pin, ""), ("var", "Variable", var, ""), ("button", "Button", button, "")],
+        build, on_apply)

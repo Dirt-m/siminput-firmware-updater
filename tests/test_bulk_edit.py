@@ -8,7 +8,8 @@ from siminput_updater.config_model import ALL_KNOWN_PINS, Rule  # noqa: E402
 from siminput_updater.rule_list import (  # noqa: E402
     History, count_matches, default_offsets, diff_span, move_to_gap, nudge, pin_range,
     range_rules, remove_indices, replace_refs, rule_matches, rules_from_text, rules_to_text, shift_name,
-    shifted_copies, variables_in,
+    shifted_copies, variables_in, encoder_template, three_way_template, toggle_template,
+    next_variable,
 )
 
 PINS = set(ALL_KNOWN_PINS)
@@ -131,6 +132,25 @@ class Filter(unittest.TestCase):
         self.assertTrue(rule_matches(Rule(type="TOGGLE", input="D5", output="TOGGLE1"), "togg"))
         self.assertFalse(rule_matches(enc, "toggle", "Rotary Encoder"))
         self.assertTrue(rule_matches(enc, ""))
+
+
+class Templates(unittest.TestCase):
+    def test_encoder(self):
+        (r,) = encoder_template("D1", "D2", axis="AX1")
+        self.assertEqual((r.type, r.inputs, r.axis, r.cw, r.ccw, r.step), ("ENCODER", ["D1", "D2"], "AX1", "", "", 2048))
+        (b,) = encoder_template("D1", "D2", cw="B5", ccw="B6")
+        self.assertEqual((b.axis, b.cw, b.ccw, b.step), ("", "B5", "B6", 1))
+
+    def test_three_way(self):
+        rules = three_way_template("D3", "D4", 10)
+        self.assertEqual([(r.type, r.input or r.inputs, r.output) for r in rules],
+                         [("MAP", "D3", "B10"), ("MAP", "D4", "B11"), ("NOR", ["D3", "D4"], "B12")])
+
+    def test_toggle_and_next_variable(self):
+        rules = toggle_template("D5", "TOGGLE2", "B7")
+        self.assertEqual([(r.type, r.input, r.output) for r in rules],
+                         [("TOGGLE", "D5", "TOGGLE2"), ("MAP", "TOGGLE2", "B7")])
+        self.assertEqual(next_variable("TOGGLE", {"TOGGLE1", "TOGGLE3"}), "TOGGLE2")
 
 
 class Clipboard(unittest.TestCase):

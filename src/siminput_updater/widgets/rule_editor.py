@@ -968,8 +968,8 @@ class RuleEditor(ctk.CTkFrame):
         bar.grid(row=0, column=0, sticky="ew", padx=4, pady=(0, 8))
         bar.grid_columnconfigure(3, weight=1)
         t.primary_button(bar, "+ Add rule", self.add_rule, width=120).grid(row=0, column=0, sticky="w")
-        t.ghost_button(bar, "Add range…", self.open_range_dialog, width=104).grid(
-            row=0, column=1, sticky="w", padx=(8, 0))
+        self._add_menu_btn = t.ghost_button(bar, "Add…  ▾", self._open_add_menu, width=90)
+        self._add_menu_btn.grid(row=0, column=1, sticky="w", padx=(8, 0))
         t.ghost_button(bar, "Find and replace…", self.open_find_dialog, width=140).grid(
             row=0, column=2, sticky="w", padx=(8, 0))
 
@@ -1780,6 +1780,36 @@ class RuleEditor(ctk.CTkFrame):
         if added:
             note += f" and variable{'s' if len(added) > 1 else ''} {', '.join(added)}"
         self._show_hint(note, 4000)
+
+    def _open_add_menu(self):
+        """Ready-made patterns: a range of buttons, and the common switches."""
+        from . import bulk_dialogs as bd
+        menu = tk.Menu(
+            self, tearoff=0, relief="flat", borderwidth=0,
+            bg=t.resolve(t.SURFACE_2), fg=t.resolve(t.TEXT),
+            activebackground=t.resolve(t.HOVER), activeforeground=t.resolve(t.TEXT),
+            font=t.tk_font(self, 12),
+        )
+        menu.add_command(label="Range of rules…  (D1-D16 → B1-B16)", command=self.open_range_dialog)
+        menu.add_separator()
+        for label, factory in (("Encoder with axis…", bd.encoder_dialog),
+                               ("3-position switch…", bd.three_way_dialog),
+                               ("Toggle with button…", bd.toggle_dialog)):
+            menu.add_command(label=label, command=lambda f=factory: self._open_template(f))
+        b = self._add_menu_btn
+        _popup(menu, b.winfo_rootx(), b.winfo_rooty() + b.winfo_height())
+
+    def _open_template(self, factory):
+        self._dialog = factory(self, self._apply_template)
+
+    def _apply_template(self, rules: list[Rule], new_vars: list[str], new_axes: list[str]):
+        added = self.page.ensure_variables(new_vars) + self.page.ensure_axes(new_axes)
+        idx = self.selected_indices()
+        at = idx[-1] + 1 if idx else len(self._model)
+        new, sel = insert_rules(self._rules(), at, rules)
+        self._apply(new, select=sel)
+        note = f"Added {len(rules)} rule{'s' if len(rules) > 1 else ''}"
+        self._show_hint(note + (f" and {', '.join(added)}" if added else ""), 3000)
 
     def open_range_dialog(self):
         from .bulk_dialogs import RangeDialog
