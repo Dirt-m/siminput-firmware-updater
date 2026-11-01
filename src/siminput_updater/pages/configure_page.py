@@ -520,6 +520,19 @@ class ConfigurePage(ctk.CTkFrame):
             self._add_var(BoolVar(id=n))
         return added
 
+    def ensure_axes(self, names: list[str]) -> list[str]:
+        """Add the named axes the Axes tab doesn't have yet, each on a free
+        output slot; returns the ones added."""
+        existing = set(self.rule_editor.axis_choices()) | set(self.variable_names())
+        added = [n for n in dict.fromkeys(names) if n and n not in existing]
+        for n in added:
+            ax = self._new_axis()
+            ax.id = n
+            self._add_axis(ax)
+        if added:
+            self.rule_editor.refresh_axis_menus()
+        return added
+
     def _var_from_widgets(self, w: dict) -> BoolVar:
         return BoolVar(id=w["name"].get().strip(), default=bool(w["default"].get()),
                        store=bool(w["store"].get()), extra=dict(w.get("extra", {})))
