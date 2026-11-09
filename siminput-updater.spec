@@ -6,7 +6,12 @@ ctk_path = Path(customtkinter.__path__[0])
 a = Analysis(
     ["entry.py"],
     pathex=["src"],
-    datas=[(str(ctk_path), "customtkinter")],
+    datas=[
+        (str(ctk_path), "customtkinter"),
+        # flash_nuke.uf2, CircuitPython and their notices, for switching back
+        # to the stock firmware (switch.ASSETS).
+        ("src/siminput_updater/assets", "siminput_updater/assets"),
+    ],
     hiddenimports=["customtkinter"],
 )
 

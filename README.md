@@ -46,7 +46,11 @@ sudo apt install python3-tk        # Ubuntu / Debian
 
 **Calibrates analog sensors.** With firmware 2.7 or later, an Analog Axis rule maps a pedal, pot, or hall sensor to an axis. The Calibrate window shows the raw reading live, records the travel as you move the sensor, and captures the rest position with a suggested deadzone. Analog Threshold turns any analog pin or axis into a button.
 
-**Flashes firmware safely.** Upload firmware packages (`.zip`) with chunked transfer, SHA-256 verification, and live progress.
+**Flashes firmware safely.** The Update page fetches the latest firmware from GitHub on its own and checks it before use. Flashing uses chunked transfer, SHA-256 verification, and live progress. You can still pick a `.zip` by hand.
+
+**Switches to MobiFlight and back.** On a rev2 box, one click puts [SIMINPUT firmware for MobiFlight](https://github.com/Dirt-m/siminput-mobiflight) on it. Your configuration is backed up first. Switching back erases the box, installs CircuitPython and the SIMINPUT firmware, and restores the backup. On Windows the app can also put the MobiFlight Connector files in place.
+
+**Sets up new boxes.** A box in bootloader mode (the RPI-RP2 drive, or BOOTSEL held while plugging in) shows up on the Update page, ready for either firmware.
 
 **Works without hardware.** Run with `--mock` to explore and develop against a simulated device.
 
@@ -66,6 +70,8 @@ uv run siminput-updater --mock   # run against a simulated device
 |------|--------------|
 | `--mock` | Use a simulated device. Also settable via `SIMINPUT_MOCK=1`. |
 | `--scale <factor>` | Override the UI scale factor, e.g. `1.5` for Linux HiDPI. Also settable via `SIMINPUT_SCALE`. |
+| `SIMINPUT_MOCK_STATE` | With `--mock`, start the simulated box in `bootsel`, `mobiflight` or `circuitpy` instead of on the stock firmware. |
+| `SIMINPUT_MOCK_BOARD` | With `--mock`, simulate a `rev1` box instead of `rev2`. |
 
 ### Building an executable
 
@@ -97,3 +103,5 @@ The app talks to controllers over a JSON-line serial protocol.
 ## License
 
 Released under the [MIT License](LICENSE). Open source, like the rest of SIMINPUT.
+
+To put a box back on the stock firmware, the app ships two unmodified third-party files: `flash_nuke.uf2` from Raspberry Pi (BSD 3-Clause) and CircuitPython 9.2.8 for the Raspberry Pi Pico (MIT). Their notices are in [`src/siminput_updater/assets/THIRD_PARTY_NOTICES.txt`](src/siminput_updater/assets/THIRD_PARTY_NOTICES.txt).

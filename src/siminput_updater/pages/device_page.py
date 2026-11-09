@@ -71,7 +71,7 @@ class DevicePage(ctk.CTkFrame):
             row=0, column=0, padx=(0, 8))
         ctk.CTkLabel(
             self._info_empty,
-            text="No device connected — pick one from the connection menu in the top-right.",
+            text="No device connected. A new box, or one on MobiFlight firmware, is set up on the Update page.",
             font=t.font(13), text_color=t.TEXT_DIM, anchor="w",
         ).grid(row=0, column=1, sticky="w")
 

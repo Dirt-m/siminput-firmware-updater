@@ -107,16 +107,20 @@ def main():
     _fix_linux_scroll()
 
     if use_mock:
-        from .mock_device import MockDevice
-        device = MockDevice()
+        from .mock_device import MockDevice, MockHardware
+        # rev2 is the current box (SIMINPUT_MOCK_BOARD=rev1 for the old one).
+        device = MockDevice(board_map=os.environ.get("SIMINPUT_MOCK_BOARD", "rev2"))
+        hardware = MockHardware(device)
     else:
         from .device import Device
+        from .switch import RealHardware
         device = Device()
+        hardware = RealHardware()
 
     from .app import App
-    app = App(device)
+    app = App(device, hardware)
 
-    if use_mock:
+    if use_mock and device.present:
         info = device.connect("MOCK")
         full_info = device.get_info()
         app.notify_connected(info, full_info)

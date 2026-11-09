@@ -1,18 +1,25 @@
 from __future__ import annotations
 
 import copy
+import json
+import os
 import random
 import re
+import shutil
+import tempfile
 import threading
 import time
+from pathlib import Path
 from typing import Callable
 
 from .config_model import (
     ANALOG_MAX, THRESHOLD_HYSTERESIS_DEFAULT, Config, analog_pins_for_board, pins_for_board, validate,
 )
 from .device import DeviceError, DeviceInfo, FullDeviceInfo
+from .mobiflight import SIMINPUT_TYPE, MobiFlightBox
 
-MOCK_BOARD_MAP = "rev1"
+MOCK_BOARD_MAP = "rev1"   # the tests' board; the --mock app picks its own
+MOCK_USB_SERIAL = "E6614103E7A1B22F"
 MOCK_VERSION = "2.7.0-mock"
 ANALOG_STREAM_DELTA = 64   # serial_handler._ANALOG_STREAM_DELTA
 ANALOG_DRIFT = 500         # max raw counts a fake sensor moves per tick
@@ -39,7 +46,8 @@ MOCK_CONFIG = {
 
 
 class MockDevice:
-    def __init__(self, config: dict | None = None):
+    def __init__(self, config: dict | None = None, board_map: str = MOCK_BOARD_MAP):
+        self._board = board_map
         self._config = config or copy.deepcopy(MOCK_CONFIG)
         self._version = MOCK_VERSION
         self.fault = ""   # e.g. "no_expander" or "analog_init:A6", like box.fault
@@ -65,10 +73,14 @@ class MockDevice:
         self._stream_prev_pins: dict[str, bool] = {}
         self._stream_prev_analog: dict[str, int] | None = None
         self._update_staging: dict[str, bytes] | None = None
+        # Plugged in and running the stock firmware. MockHardware clears it
+        # while the simulated box is in its bootloader or on MobiFlight.
+        self.present = True
+        self.on_bootloader: Callable[[], None] | None = None
         self._init_state()
 
     def _init_state(self):
-        self._pins = {p: False for p in pins_for_board(MOCK_BOARD_MAP)}
+        self._pins = {p: False for p in pins_for_board(self._board)}
         cfg = Config.from_dict(self._config)
         self._bools = {b.id: b.default for b in cfg.bools}
         self._axis_slots = {}
@@ -77,7 +89,7 @@ class MockDevice:
             if isinstance(slot, int) and 1 <= slot <= 8:
                 self._axes[slot - 1] = a.default
                 self._axis_slots[a.id] = slot
-        adc = set(analog_pins_for_board(MOCK_BOARD_MAP))
+        adc = set(analog_pins_for_board(self._board))
         self._analog_rules = [r for r in cfg.rules if not r.comment and r.type == "ANALOG"]
         self._threshold_rules = [r for r in cfg.rules if not r.comment and r.type == "THRESHOLD"]
         self._threshold_state = {}
@@ -165,28 +177,32 @@ class MockDevice:
     def info(self) -> DeviceInfo | None:
         return self._info
 
+    @property
+    def usb_serial(self) -> str | None:
+        return MOCK_USB_SERIAL if self._connected else None
+
     def ensure_keepalive(self) -> None:
         pass
 
-    @staticmethod
-    def list_ports() -> set[str]:
-        return {"MOCK"}
+    def list_ports(self) -> set[str]:
+        return {"MOCK"} if self.present else set()
 
-    @staticmethod
-    def discover(skip_ports: set[str] | None = None) -> list[DeviceInfo]:
-        if skip_ports and "MOCK" in skip_ports:
+    def discover(self, skip_ports: set[str] | None = None) -> list[DeviceInfo]:
+        if not self.present or (skip_ports and "MOCK" in skip_ports):
             return []
         return [DeviceInfo(
             product="SIMINPUT",
-            version=MOCK_VERSION,
-            name="Mock SimInput Box",
+            version=self._version,
+            name=self._config.get("device", {}).get("name", "Mock SimInput Box"),
             pid=0xF000,
             port="MOCK",
-            board_map=MOCK_BOARD_MAP,
+            board_map=self._board,
         )]
 
     def connect(self, port_name: str) -> DeviceInfo:
         self.disconnect()  # like the real Device: connect always starts clean
+        if not self.present:
+            raise DeviceError(f"Failed to open {port_name}: no such device")
         self._connected = True
         self._info = DeviceInfo(
             product="SIMINPUT",
@@ -194,7 +210,7 @@ class MockDevice:
             name=self._config.get("device", {}).get("name", "Mock SimInput Box"),
             pid=self._config.get("device", {}).get("pid", 0xF000),
             port=port_name,
-            board_map=MOCK_BOARD_MAP,
+            board_map=self._board,
         )
         return self._info
 
@@ -210,7 +226,7 @@ class MockDevice:
             name=self._config.get("device", {}).get("name", "Mock SimInput Box"),
             pid=self._config.get("device", {}).get("pid", 0xF000),
             port="MOCK",
-            board_map=MOCK_BOARD_MAP,
+            board_map=self._board,
         )
 
     def get_info(self) -> FullDeviceInfo:
@@ -220,11 +236,11 @@ class MockDevice:
             name=self._config.get("device", {}).get("name", "Mock SimInput Box"),
             pid=self._config.get("device", {}).get("pid", 0xF000),
             port="MOCK",
-            board_map=MOCK_BOARD_MAP,
+            board_map=self._board,
             circuitpython="9.2.0",
             board="raspberry_pi_pico",
             nvm_size=4096,
-            pins=sorted(pins_for_board(MOCK_BOARD_MAP)),
+            pins=sorted(pins_for_board(self._board)),
             bools=[b["id"] for b in self._config.get("bools", [])],
             axes=[a["id"] for a in self._config.get("axes", [])],
             rules_count=len(self._config.get("rules", [])),
@@ -232,7 +248,7 @@ class MockDevice:
             protocol=2,
             caps=("staged_update", "hard_reboot", "stream", "chunked_config", "request_id", "analog"),
             limits={"max_line": 4096, "chunk": 2048, "max_config": 32768},
-            analog_pins=sorted(analog_pins_for_board(MOCK_BOARD_MAP)),
+            analog_pins=sorted(analog_pins_for_board(self._board)),
             analog_active=sorted(self._analog),
             fault=self.fault,
         )
@@ -242,7 +258,7 @@ class MockDevice:
 
     def set_config(self, config: dict) -> dict:
         cfg = Config.from_dict(config)
-        errs = validate(cfg, board_map=MOCK_BOARD_MAP)
+        errs = validate(cfg, board_map=self._board)
         if errs:
             raise DeviceError(str(errs[0]))
         self._config = copy.deepcopy(config)
@@ -251,7 +267,7 @@ class MockDevice:
 
     def validate_config(self, config: dict) -> None:
         cfg = Config.from_dict(config)
-        errs = validate(cfg, board_map=MOCK_BOARD_MAP)
+        errs = validate(cfg, board_map=self._board)
         if errs:
             raise DeviceError(str(errs[0]))
 
@@ -425,9 +441,154 @@ class MockDevice:
         self._info = None
 
     def enter_bootloader(self) -> None:
+        self.stop_stream()
         self._connected = False
         self._info = None
+        if self.on_bootloader:
+            self.on_bootloader()
 
     def wait_for_reconnect(self, port_name: str, timeout: float = 15.0) -> DeviceInfo:
         time.sleep(1.0)
         return self.connect(port_name)
+
+
+class MockHardware:
+    """The world outside the serial port, simulated for --mock: the RPI-RP2
+    and CIRCUITPY drives (real folders in a temp dir) and a box on SIMINPUT
+    firmware for MobiFlight. Copying a UF2 or replugging moves the simulated
+    box between states a moment later, like the real one.
+
+    SIMINPUT_MOCK_STATE=bootsel / mobiflight / circuitpy starts the box there
+    instead of on the stock firmware (a fresh board is "bootsel").
+    """
+
+    MF_PORT = "MOCK-MF"
+
+    def __init__(self, device: MockDevice, start: str | None = None, time_scale: float = 1.0):
+        from . import switch
+        self._switch = switch
+        self.device = device
+        self.time_scale = time_scale    # tests run the simulation faster
+        self.root = Path(tempfile.mkdtemp(prefix="siminput-mock-drives-"))
+        self.mf_version = "0.1.0"
+        # One lock for the whole simulation: timers move the state while
+        # the flow (or the panel's scan) is in the middle of a call.
+        self._lock = threading.RLock()
+        self._pending: list[tuple[float, str]] = []
+        self._state = ""
+        device.on_bootloader = lambda: self._later(("gone", 0.0), ("bootsel", 1.0))
+        self._set(start or os.environ.get("SIMINPUT_MOCK_STATE", "stock"))
+
+    # -- state machine --
+
+    def _drive(self, label: str) -> Path:
+        return self.root / label
+
+    def _set(self, state: str) -> None:
+        self._state = state
+        if state != "stock":
+            self.device.present = False
+            if self.device.connected:
+                self.device.disconnect()
+        boot = self._drive("RPI-RP2")
+        if state == "bootsel":
+            shutil.rmtree(boot, ignore_errors=True)
+            boot.mkdir(parents=True)
+            (boot / "INFO_UF2.TXT").write_text(
+                "UF2 Bootloader v3.0\nModel: Raspberry Pi RP2\nBoard-ID: RPI-RP2\n")
+        cp = self._drive("CIRCUITPY")
+        if state == "circuitpy" and not (cp / "boot_out.txt").exists():
+            cp.mkdir(parents=True, exist_ok=True)
+            (cp / "boot_out.txt").write_text(
+                "Adafruit CircuitPython 9.2.8 on 2025-05-28; Raspberry Pi Pico with rp2040\n"
+                "Board ID:raspberry_pi_pico\n")
+            (cp / "code.py").write_text('print("Hello World!")\n')
+            (cp / "lib").mkdir(exist_ok=True)
+        if state == "stock":
+            if (cp / "code.py").exists() and (cp / "config.json").exists():
+                self._adopt_stock_install(cp)
+            self.device.present = True   # last: the box answers once it has booted
+
+    def _adopt_stock_install(self, cp: Path) -> None:
+        """The simulated replug: the box boots what was copied onto CIRCUITPY."""
+        try:
+            self.device._config = json.loads((cp / "config.json").read_text())
+        except (OSError, ValueError):
+            pass
+        handler = cp / "lib" / "serial_handler.py"
+        if handler.exists():
+            m = re.search(r'FW_VERSION = "([^"]+)"', handler.read_text(errors="replace"))
+            if m:
+                self.device._version = m.group(1)
+        self.device._init_state()
+        shutil.rmtree(cp, ignore_errors=True)
+
+    def _later(self, *steps: tuple[str, float]) -> None:
+        """Move through `steps` ((state, delay) pairs) on timers, like the
+        real box does on its own; a newer call replaces what is left."""
+        now = time.monotonic()
+        with self._lock:
+            self._pending = [(now + delay * self.time_scale, state) for state, delay in steps]
+        for _state, delay in steps:
+            timer = threading.Timer(delay * self.time_scale + 0.001, self._tick)
+            timer.daemon = True
+            timer.start()
+
+    def _tick(self) -> None:
+        with self._lock:
+            now = time.monotonic()
+            while self._pending and self._pending[0][0] <= now:
+                _, state = self._pending.pop(0)
+                self._set(state)
+
+    # -- switch.Hardware --
+
+    def find_drive(self, label: str) -> Path | None:
+        with self._lock:
+            self._tick()
+            want = {"RPI-RP2": "bootsel", "CIRCUITPY": "circuitpy"}.get(label)
+            return self._drive(label) if self._state == want else None
+
+    def mobiflight_ports(self) -> list[tuple[str, str]]:
+        with self._lock:
+            self._tick()
+            return [(self.MF_PORT, MOCK_USB_SERIAL)] if self._state == "mobiflight" else []
+
+    def probe_mobiflight(self, port: str, usb_serial: str = "") -> MobiFlightBox:
+        with self._lock:
+            self._tick()
+            if self._state != "mobiflight" or port != self.MF_PORT:
+                return MobiFlightBox(port, usb_serial, status="error", detail="no such port")
+            time.sleep(0.2 * self.time_scale)
+            return MobiFlightBox(port, usb_serial, type=SIMINPUT_TYPE, name=SIMINPUT_TYPE,
+                                 serial="SN-" + MOCK_USB_SERIAL[:10], version=self.mf_version)
+
+    def touch_1200(self, port: str) -> None:
+        with self._lock:
+            self._tick()
+            if self._state == "mobiflight" and port == self.MF_PORT:
+                self._later(("gone", 0.0), ("bootsel", 1.0))
+
+    def write_file(self, path: Path, data: bytes) -> None:
+        with self._lock:
+            self._tick()
+            time.sleep(min(1.5, len(data) / 2_000_000) * self.time_scale)   # USB full speed, roughly
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(data)
+            sw = self._switch
+            if self._state == "bootsel" and path.parent == self._drive("RPI-RP2"):
+                if path.name == sw.NUKE_UF2:
+                    shutil.rmtree(self._drive("CIRCUITPY"), ignore_errors=True)
+                    self._later(("gone", 0.0), ("bootsel", 1.5))
+                elif path.name == sw.CIRCUITPYTHON_UF2:
+                    self._later(("gone", 0.0), ("circuitpy", 2.5))
+                else:
+                    self._later(("gone", 0.0), ("mobiflight", 2.0))
+            elif (self._state == "circuitpy" and path.name == "code.py"
+                  and (self._drive("CIRCUITPY") / "boot.py").exists()):
+                # Pretend the user unplugs and replugs a few seconds later.
+                self._later(("gone", 4.0), ("stock", 6.0))
+
+    def community_dir(self) -> Path | None:
+        with self._lock:
+            return self.root / "Community"

@@ -15,11 +15,18 @@ from .. import ui_theme as t
 from ..config_history import Backup, backup_dirs, list_backups
 
 
+LOAD_INTRO = ("A copy of the box's config is kept before every save and every firmware "
+              "update. Load one into the editor, check it, then Save to device to restore it.")
+
+
 class HistoryDialog(ctk.CTkToplevel):
-    def __init__(self, master, on_load: Callable[[Backup], None]):
+    def __init__(self, master, on_load: Callable[[Backup], None], *, title: str = "Config history",
+                 intro: str = LOAD_INTRO, action: str = "Load",
+                 extra: tuple[str, Callable[[], None]] | None = None):
         super().__init__(master)
         self._on_load = on_load
-        self.title("Config history")
+        self._action = action
+        self.title(title)
         self.configure(fg_color=t.SURFACE)
         self.transient(master.winfo_toplevel())
         self.bind("<Escape>", lambda _e: self.destroy())
@@ -27,8 +34,7 @@ class HistoryDialog(ctk.CTkToplevel):
         self.grid_rowconfigure(1, weight=1)
 
         ctk.CTkLabel(
-            self, text="A copy of the box's config is kept before every save and every firmware "
-                       "update. Load one into the editor, check it, then Save to device to restore it.",
+            self, text=intro,
             font=t.font(12), text_color=t.TEXT_DIM, anchor="w", justify="left", wraplength=520,
         ).grid(row=0, column=0, padx=20, pady=(18, 10), sticky="w")
 
@@ -41,7 +47,11 @@ class HistoryDialog(ctk.CTkToplevel):
         btns.grid(row=2, column=0, padx=20, pady=(12, 18), sticky="ew")
         btns.grid_columnconfigure(0, weight=1)
         t.ghost_button(btns, "Open folder", self._open_folder, width=120).grid(row=0, column=0, sticky="w")
-        t.ghost_button(btns, "Close", self.destroy, width=90).grid(row=0, column=1, sticky="e")
+        if extra is not None:
+            label, fn = extra
+            t.ghost_button(btns, label, lambda: (self.destroy(), fn()), width=170).grid(
+                row=0, column=1, padx=(0, 8), sticky="e")
+        t.ghost_button(btns, "Close", self.destroy, width=90).grid(row=0, column=2, sticky="e")
 
         self.backups = list_backups()
         self._fill()
@@ -68,7 +78,7 @@ class HistoryDialog(ctk.CTkToplevel):
             ctk.CTkLabel(self.list, text=detail, font=t.font(12),
                          text_color=t.TEXT_DIM if b.readable else t.ERROR,
                          anchor="w").grid(row=i, column=1, pady=6, sticky="w")
-            btn = t.ghost_button(self.list, "Load", lambda b=b: self._load(b), width=70, height=28)
+            btn = t.ghost_button(self.list, self._action, lambda b=b: self._load(b), width=70, height=28)
             btn.grid(row=i, column=2, padx=(8, 12), pady=6)
             if not b.readable:
                 btn.configure(state="disabled")
