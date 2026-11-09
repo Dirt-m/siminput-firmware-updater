@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import queue
 import threading
-import webbrowser
 from typing import Callable
 
 import customtkinter as ctk
@@ -26,15 +25,18 @@ SCAN_INTERVAL_MS = 1000        # cheap port-presence tick
 RESCAN_TICKS = 3               # full re-probe cadence while unconnected, in ticks
 CONNECT_COOLDOWN_TICKS = 3     # ticks a port sits out of auto-connect after failing
 LABEL_SEARCHING = "Searching for devices…"
-FIRMWARE_RELEASES_URL = "https://github.com/Dirt-m/siminput-firmware-v2/releases"
 CONNECTABLE = ("ok", "no_response")
 UI_QUEUE_POLL_MS = 33   # ~30 fps; the rate worker callbacks reach the UI
 
 
 class App(ctk.CTk):
-    def __init__(self, device):
+    def __init__(self, device, hardware=None):
         super().__init__()
         self.device = device
+        if hardware is None:
+            from .switch import RealHardware
+            hardware = RealHardware()
+        self.hardware = hardware   # drives and MobiFlight ports, for switching firmware
         self.full_info = None
 
         ctk.set_appearance_mode("system")
@@ -236,23 +238,13 @@ class App(ctk.CTk):
         self._conn_menu.set(LABEL_SEARCHING)
         self._conn_menu.grid(row=0, column=1, padx=(0, 4), pady=3)
 
-        self._firmware_btn = ctk.CTkButton(
-            header, text="Find the latest firmware", height=36, corner_radius=t.RADIUS,
-            fg_color=t.SURFACE_2, hover_color=t.HOVER, text_color=t.TEXT,
-            font=t.font(12, "bold"), command=self._open_firmware_releases,
-        )
-        self._firmware_btn.grid(row=0, column=2, padx=(0, 10), pady=14)
-
         self._theme_btn = ctk.CTkButton(
             header, text="", width=36, height=36, corner_radius=t.RADIUS,
             fg_color=t.SURFACE_2, hover_color=t.HOVER, text_color=t.TEXT,
             font=t.font(16), command=self._toggle_theme,
         )
-        self._theme_btn.grid(row=0, column=3, padx=(0, 24), pady=14)
+        self._theme_btn.grid(row=0, column=2, padx=(0, 24), pady=14)
         self._sync_theme_button()
-
-    def _open_firmware_releases(self):
-        webbrowser.open(FIRMWARE_RELEASES_URL)
 
     def _build_content(self):
         self.content = ctk.CTkFrame(self, fg_color=t.BG)

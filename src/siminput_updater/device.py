@@ -139,6 +139,11 @@ class Device:
     def info(self) -> DeviceInfo | None:
         return self._info
 
+    @property
+    def usb_serial(self) -> str | None:
+        """The connected box's USB serial number (the RP2040's flash id)."""
+        return self._serial_number
+
     # ------------------------------------------------------------- transport
 
     def _flush_input(self):
@@ -1028,6 +1033,9 @@ class DeviceLike(Protocol):
     @property
     def info(self) -> DeviceInfo | None: ...
 
+    @property
+    def usb_serial(self) -> str | None: ...
+
     def ensure_keepalive(self) -> None: ...
 
     def connect(self, port_name: str) -> DeviceInfo: ...
@@ -1063,5 +1071,7 @@ class DeviceLike(Protocol):
                    should_cancel: Callable[[], bool] | None = None) -> None: ...
 
     def reboot(self, hard: bool = False) -> None: ...
+
+    def enter_bootloader(self) -> None: ...
 
     def wait_for_reconnect(self, port_name: str, timeout: float = 15.0) -> DeviceInfo: ...

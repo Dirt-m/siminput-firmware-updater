@@ -1,11 +1,13 @@
-"""The latest firmware release on GitHub: look it up, download its package.
+"""The latest firmware releases on GitHub: look one up, download its package.
 
-The download is checked before it is used: the URL must point into this
-repo's release downloads, the file name must look like a firmware package,
+Two sources: the stock firmware (`STOCK`) and SIMINPUT firmware for
+MobiFlight (`MOBIFLIGHT`). The download is checked before it is used: the
+URL must point into that repo's release downloads, the file name must look
+like its package,
 the size must match what GitHub lists (and stay under MAX_BYTES), and the
 SHA-256 must match the digest GitHub publishes for the asset. The zip then
-goes through `firmware.load_firmware_zip` like a hand-picked file, which
-checks every file against its manifest.
+goes through `firmware.load_firmware_zip` (stock) or `switch.load_mobiflight_package`
+(MobiFlight) like a hand-picked file.
 
 `opener` parameters exist so tests run without a network.
 """
@@ -21,10 +23,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
-REPO = "Dirt-m/siminput-firmware-v2"
-LATEST_API = f"https://api.github.com/repos/{REPO}/releases/latest"
-DOWNLOAD_PREFIX = f"https://github.com/{REPO}/releases/download/"
-ASSET_NAME = re.compile(r"^siminput-firmware-[0-9A-Za-z.\-]+\.zip$")
 MAX_BYTES = 10 * 1024 * 1024
 CHUNK = 16 * 1024
 TIMEOUT_S = 15
@@ -32,6 +30,30 @@ TIMEOUT_S = 15
 
 class ReleaseError(Exception):
     pass
+
+
+@dataclass(frozen=True)
+class Source:
+    repo: str
+    asset_name: re.Pattern
+
+    @property
+    def latest_api(self) -> str:
+        return f"https://api.github.com/repos/{self.repo}/releases/latest"
+
+    @property
+    def download_prefix(self) -> str:
+        return f"https://github.com/{self.repo}/releases/download/"
+
+
+STOCK = Source("Dirt-m/siminput-firmware-v2", re.compile(r"^siminput-firmware-[0-9A-Za-z.\-]+\.zip$"))
+MOBIFLIGHT = Source("Dirt-m/siminput-mobiflight", re.compile(r"^siminput_rev2_[0-9A-Za-z.\-]+\.zip$"))
+
+# The stock source, under the names the rest of the app and the tests use.
+REPO = STOCK.repo
+LATEST_API = STOCK.latest_api
+DOWNLOAD_PREFIX = STOCK.download_prefix
+ASSET_NAME = STOCK.asset_name
 
 
 @dataclass
@@ -52,17 +74,17 @@ def _request(url: str) -> urllib.request.Request:
     })
 
 
-def parse_release(data: dict) -> Release:
+def parse_release(data: dict, source: Source = STOCK) -> Release:
     """The release's firmware asset, or ReleaseError saying what is wrong."""
     if not isinstance(data, dict) or "tag_name" not in data:
         raise ReleaseError("GitHub sent something that isn't a release")
     tag = str(data["tag_name"])
-    assets = [a for a in data.get("assets") or [] if ASSET_NAME.match(str(a.get("name", "")))]
+    assets = [a for a in data.get("assets") or [] if source.asset_name.match(str(a.get("name", "")))]
     if not assets:
         raise ReleaseError(f"Release {tag} has no firmware package attached")
     a = assets[0]
     url = str(a.get("browser_download_url", ""))
-    if not url.startswith(DOWNLOAD_PREFIX):
+    if not url.startswith(source.download_prefix):
         raise ReleaseError("The package link doesn't point to the firmware repository")
     size = a.get("size")
     if not isinstance(size, int) or not 0 < size <= MAX_BYTES:
@@ -73,15 +95,15 @@ def parse_release(data: dict) -> Release:
                    size=size, sha256=sha, page_url=str(data.get("html_url", "")))
 
 
-def fetch_latest(opener=urllib.request.urlopen) -> Release:
+def fetch_latest(opener=urllib.request.urlopen, source: Source = STOCK) -> Release:
     try:
-        with opener(_request(LATEST_API), timeout=TIMEOUT_S) as resp:
+        with opener(_request(source.latest_api), timeout=TIMEOUT_S) as resp:
             data = json.loads(resp.read(1024 * 1024))
     except ReleaseError:
         raise
     except Exception as e:
         raise ReleaseError(f"Couldn't reach GitHub ({e})") from e
-    return parse_release(data)
+    return parse_release(data, source)
 
 
 def download_dir() -> Path:
@@ -94,10 +116,15 @@ def download(release: Release, dest: Path | None = None,
              opener=urllib.request.urlopen) -> Path:
     """Fetch the package to `dest` (a folder) and return its path. Written to
     a temporary name first, so a failed or cancelled download leaves nothing
-    that looks like a package."""
+    that looks like a package. A file from an earlier download is reused when
+    its size and checksum still match."""
     dest = dest or download_dir()
     dest.mkdir(parents=True, exist_ok=True)
     final = dest / release.asset_name
+    if release.sha256 and _matches(final, release):
+        if progress:
+            progress(release.size, release.size)
+        return final
     part = final.with_suffix(".part")
     h = hashlib.sha256()
     got = 0
@@ -128,3 +155,12 @@ def download(release: Release, dest: Path | None = None,
     except Exception as e:
         part.unlink(missing_ok=True)
         raise ReleaseError(f"Download failed ({e})") from e
+
+
+def _matches(path: Path, release: Release) -> bool:
+    try:
+        if path.stat().st_size != release.size:
+            return False
+        return hashlib.sha256(path.read_bytes()).hexdigest() == release.sha256
+    except OSError:
+        return False
