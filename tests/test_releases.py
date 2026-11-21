@@ -1,15 +1,18 @@
 import hashlib
 import io
 import json
+import os
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 from siminput_updater.releases import (  # noqa: E402
-    DOWNLOAD_PREFIX, Release, ReleaseError, download, fetch_latest, parse_release,
+    CA_BUNDLES, DOWNLOAD_PREFIX, Release, ReleaseError, download, fetch_latest, parse_release,
+    ssl_context,
 )
 
 PAYLOAD = b"PK fake zip bytes" * 100
@@ -90,6 +93,22 @@ class Download(unittest.TestCase):
     def test_cancel(self):
         with self.assertRaises(ReleaseError):
             download(self.rel, self.dir, should_cancel=lambda: True, opener=_opener(PAYLOAD))
+
+
+class Certificates(unittest.TestCase):
+    """A packaged build whose OpenSSL looks for CA certificates in a folder
+    this distro doesn't have."""
+
+    def setUp(self):
+        gone = {"SSL_CERT_FILE": "/nonexistent/cert.pem", "SSL_CERT_DIR": "/nonexistent/certs"}
+        p = mock.patch.dict(os.environ, gone)
+        p.start()
+        self.addCleanup(p.stop)
+
+    @unittest.skipUnless(any(Path(b).is_file() for b in CA_BUNDLES), "no system CA bundle here")
+    def test_falls_back_to_the_system_bundle(self):
+        self.assertEqual(ssl_context(bundles=()).cert_store_stats()["x509_ca"], 0)
+        self.assertGreater(ssl_context().cert_store_stats()["x509_ca"], 0)
 
 
 if __name__ == "__main__":
