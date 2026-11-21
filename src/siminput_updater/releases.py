@@ -17,6 +17,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import ssl
 import tempfile
 import urllib.request
 from dataclasses import dataclass
@@ -28,8 +29,37 @@ CHUNK = 16 * 1024
 TIMEOUT_S = 15
 
 
+# Where Linux distros and macOS keep the system CA bundle. The packaged build
+# carries the build machine's OpenSSL, which only looks in Ubuntu's
+# /usr/lib/ssl, so on Fedora, Arch, openSUSE and others it finds no
+# certificates at all and every HTTPS request fails.
+CA_BUNDLES = (
+    "/etc/ssl/certs/ca-certificates.crt",                # Debian, Ubuntu, Arch
+    "/etc/pki/tls/certs/ca-bundle.crt",                  # Fedora, RHEL
+    "/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem", # RHEL 7+
+    "/etc/ssl/ca-bundle.pem",                            # openSUSE
+    "/etc/ssl/cert.pem",                                 # Alpine, macOS
+)
+
+
 class ReleaseError(Exception):
     pass
+
+
+def ssl_context(bundles=CA_BUNDLES) -> ssl.SSLContext:
+    """The default verifying context, plus the system CA bundle when
+    OpenSSL's own default locations gave it nothing."""
+    ctx = ssl.create_default_context()
+    if not ctx.cert_store_stats()["x509_ca"]:
+        for path in bundles:
+            if Path(path).is_file():
+                ctx.load_verify_locations(cafile=path)
+                break
+    return ctx
+
+
+def _urlopen(req, timeout=None):
+    return urllib.request.urlopen(req, timeout=timeout, context=ssl_context())
 
 
 @dataclass(frozen=True)
@@ -95,7 +125,7 @@ def parse_release(data: dict, source: Source = STOCK) -> Release:
                    size=size, sha256=sha, page_url=str(data.get("html_url", "")))
 
 
-def fetch_latest(opener=urllib.request.urlopen, source: Source = STOCK) -> Release:
+def fetch_latest(opener=_urlopen, source: Source = STOCK) -> Release:
     try:
         with opener(_request(source.latest_api), timeout=TIMEOUT_S) as resp:
             data = json.loads(resp.read(1024 * 1024))
@@ -113,7 +143,7 @@ def download_dir() -> Path:
 def download(release: Release, dest: Path | None = None,
              progress: Callable[[int, int], None] | None = None,
              should_cancel: Callable[[], bool] | None = None,
-             opener=urllib.request.urlopen) -> Path:
+             opener=_urlopen) -> Path:
     """Fetch the package to `dest` (a folder) and return its path. Written to
     a temporary name first, so a failed or cancelled download leaves nothing
     that looks like a package. A file from an earlier download is reused when
